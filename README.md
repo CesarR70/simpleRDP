@@ -1,5 +1,7 @@
 # simpleRDP
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A simple, native macOS RDP client written in **Swift / SwiftUI**, built on top of
 [FreeRDP](https://www.freerdp.com/) (the mature open-source C implementation of
 the RDP protocol). The app is a thin native shell — UI, favorites, macOS
@@ -161,5 +163,5 @@ recording.
 
 ## License
 
-Unspecified at this time — consider adding one (MIT or Apache-2.0 are common
-choices). FreeRDP itself is Apache-2.0.
+Licensed under the [Apache License 2.0](LICENSE) — the same license as
+FreeRDP itself, keeping the dependency story simple.
