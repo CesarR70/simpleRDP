@@ -22,8 +22,9 @@ simpleRDP.app/
 # Superseded/backup icon (source of truth is Resources/AppIcon.icns)
 Resources/old-AppIcon.icns
 
-# Ignore LLM .md plan
+# Ignore LLM .md plan and vscode workspace
 RDP-Swift-Client-Plan.md
+myRDP.code-workspace
 
 # SwiftPM — commit this for apps to lock dependency versions
 # Package.resolved
