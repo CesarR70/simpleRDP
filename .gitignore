@@ -18,6 +18,7 @@ workspace-state.json
 
 # Compiled .app bundle (rebuilt by Scripts/bundle.sh)
 simpleRDP.app/
+simpleRDP.zip
 
 # Superseded/backup icon (source of truth is Resources/AppIcon.icns)
 Resources/old-AppIcon.icns
