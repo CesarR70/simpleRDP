@@ -1,0 +1,39 @@
+{
+  // Debug configuration for the RDP client.
+  // Uses the Swift extension's LLDB integration (CodeLLDB).
+  // We attach to the compiled binary; note that SwiftUI apps behave fully only
+  // when launched as a bundle, so use "app: run" for real UI testing and this
+  // config for stepping through logic / the FreeRDP session layer.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug simpleRDP (binary)",
+      "program": "${workspaceFolder}/.build/debug/simpleRDP",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "swift: build (debug)"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:myRDP}",
+      "name": "Debug simpleRDP",
+      "target": "simpleRDP",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug simpleRDP"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:myRDP}",
+      "name": "Release simpleRDP",
+      "target": "simpleRDP",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release simpleRDP"
+    }
+  ]
+}

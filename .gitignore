@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Swift Package Manager build artifacts & caches
+.build/
+index-build/
+artifacts/
+checkouts/
+repositories/
+
+# SPM state / scratch files
+build.db
+debug.yaml
+release.yaml
+plugin-tools.yaml
+workspace-state.json
+
+# Compiled .app bundle (rebuilt by Scripts/bundle.sh)
+simpleRDP.app/
+
+# Superseded/backup icon (source of truth is Resources/AppIcon.icns)
+Resources/old-AppIcon.icns
+
+# SwiftPM — commit this for apps to lock dependency versions
+# Package.resolved

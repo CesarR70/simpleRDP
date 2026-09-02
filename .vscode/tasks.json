@@ -1,0 +1,62 @@
+{
+  // VSCode build/run tasks for the macOS Swift RDP client.
+  // Portable framework: paths use `brew --prefix` so they work on both
+  // Apple Silicon (/opt/homebrew) and Intel (/usr/local) Macs.
+  //
+  // Requires: Xcode Command Line Tools, Homebrew, `brew install freerdp`,
+  // and (for the bundle/run tasks) the Scripts/bundle.sh helper.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "swift: build (debug)",
+      "type": "shell",
+      "command": "swift build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$swiftc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "swift: build (release)",
+      "type": "shell",
+      "command": "swift build -c release",
+      "group": "build",
+      "problemMatcher": ["$swiftc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "swift: clean",
+      "type": "shell",
+      "command": "rm -rf .build simpleRDP.app",
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared" }
+    },
+    {
+      "label": "app: bundle (release)",
+      "detail": "Compile release build and assemble a signed .app bundle.",
+      "type": "shell",
+      "command": "./Scripts/bundle.sh",
+      "args": ["release"],
+      "group": "build",
+      "dependsOn": ["swift: build (release)"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "app: run",
+      "detail": "Bundle then launch the .app (SwiftUI needs a real bundle to behave like an app).",
+      "type": "shell",
+      "command": "open ./simpleRDP.app",
+      "dependsOn": ["app: bundle (release)"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared" }
+    },
+    {
+      "label": "deps: check freerdp",
+      "detail": "Sanity-check that FreeRDP headers/libs are discoverable.",
+      "type": "shell",
+      "command": "echo \"prefix: $(brew --prefix freerdp)\"; pkg-config --exists freerdp3 && echo 'pkg-config: freerdp3 OK' || echo 'pkg-config: freerdp3 NOT found (adjust linker flags in Package.swift)'",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    }
+  ]
+}

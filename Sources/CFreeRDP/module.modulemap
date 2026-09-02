@@ -1,0 +1,16 @@
+module CFreeRDP {
+    // Pull in just the headers we need from FreeRDP + WinPR. Exposing the whole
+    // FreeRDP/WinPR surface in one module would risk C++ symbol clashes on macOS
+    // (FreeRDP has some C++ internals leaking into headers), so we keep this
+    // minimal and add more as needed.
+    header "shim.h"
+
+    // Link the C entry points. The Swift executable target also lists these
+    // via .linkedLibrary, but listing them here keeps the module self-contained
+    // for any future test target that depends only on CFreeRDP.
+    link "freerdp3"
+    link "freerdp-client3"
+    link "winpr3"
+
+    export *
+}
