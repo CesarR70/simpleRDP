@@ -22,5 +22,8 @@ simpleRDP.app/
 # Superseded/backup icon (source of truth is Resources/AppIcon.icns)
 Resources/old-AppIcon.icns
 
+# Ignore LLM .md plan
+RDP-Swift-Client-Plan.md
+
 # SwiftPM — commit this for apps to lock dependency versions
 # Package.resolved
