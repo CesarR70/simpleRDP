@@ -18,6 +18,12 @@ struct SessionView: View {
     let input: RemoteInput
     let clipboard: ClipboardChannel
     let onDisconnect: () -> Void
+    let onResize: (UInt32, UInt32) -> Void
+    /// Session-reported current resolution (set on connect and after each
+    /// successful resize reconnect). Polled by `statusText` on every refresh-
+    /// timer repaint, so the status bar tracks resizes immediately instead of
+    /// waiting for the first EndPaint at the new size.
+    let currentResolution: () -> RDPResolution?
 
     @State private var image: CGImage?
     @State private var lastRevision: UInt64 = 0
@@ -75,6 +81,20 @@ struct SessionView: View {
                 }
 
                 Spacer()
+
+                Menu {
+                    // Standard desktop sizes. Choosing one re-negotiates the live
+                    // session's resolution via onResize (see RDPSession).
+                    ForEach(RDPResolution.presets) { res in
+                        Button(res.displayName) {
+                            onResize(res.width, res.height)
+                        }
+                    }
+                } label: {
+                    Label("Resolution", systemImage: "rectangle.arrow.triangle.2.circlepath")
+                }
+                .fixedSize()
+                .help("Change the remote desktop resolution")
 
                 if hasStagedFiles && !downloadStatus.isActive {
                     // Server→Mac files are staged in the cache. Save-to MOVES
@@ -135,7 +155,12 @@ struct SessionView: View {
 
     private var statusText: String {
         var text = state.displayLabel
-        if let dims = framebuffer.dimensions {
+        // Prefer the session-reported resolution (updates the instant a resize
+        // reconnect succeeds). Fall back to the framebuffer's frame-derived
+        // dims for sessions without a reported resolution.
+        if let res = currentResolution() {
+            text += " · \(res.width)×\(res.height)"
+        } else if let dims = framebuffer.dimensions {
             text += " · \(dims.width)×\(dims.height)"
         }
         return text

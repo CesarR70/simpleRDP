@@ -41,7 +41,11 @@ struct ContentView: View {
                         framebuffer: vm.session.framebuffer,
                         input: vm.session.input,
                         clipboard: vm.session.clipboard,
-                        onDisconnect: vm.disconnect)
+                        onDisconnect: vm.disconnect,
+                        onResize: { width, height in
+                            Task { await vm.session.setResolution(width: width, height: height) }
+                        },
+                        currentResolution: { vm.session.currentResolution })
         } else {
             ConnectView(vm: vm)
         }

@@ -37,6 +37,7 @@ struct ServerFavorite: Codable, Identifiable, Hashable {
     var endpointKind: EndpointKind = .auto
     var trustAllCertificates: Bool = false
     var sharePath: String?      // optional folder to share with the session
+    var resolution: RDPResolution = .defaultResolution // starting desktop size
 
     /// Host display string, omitting the port when it's the RDP default.
     var displayHostPort: String {
@@ -47,7 +48,8 @@ struct ServerFavorite: Codable, Identifiable, Hashable {
     // synthesized one, so it's declared explicitly for normal construction.
     init(id: UUID = UUID(), name: String, host: String, port: Int = 3389,
          username: String? = nil, endpointKind: EndpointKind = .auto,
-         trustAllCertificates: Bool = false, sharePath: String? = nil) {
+         trustAllCertificates: Bool = false, sharePath: String? = nil,
+         resolution: RDPResolution = .defaultResolution) {
         self.id = id
         self.name = name
         self.host = host
@@ -56,13 +58,14 @@ struct ServerFavorite: Codable, Identifiable, Hashable {
         self.endpointKind = endpointKind
         self.trustAllCertificates = trustAllCertificates
         self.sharePath = sharePath
+        self.resolution = resolution
     }
 
     // Tolerant decoding: favorites saved by older builds lack
-    // trustAllCertificates/sharePath; default them rather than failing the
-    // whole file (which would silently drop every saved favorite).
+    // trustAllCertificates/sharePath/resolution; default them rather than
+    // failing the whole file (which would silently drop every saved favorite).
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, port, username, endpointKind, trustAllCertificates, sharePath
+        case id, name, host, port, username, endpointKind, trustAllCertificates, sharePath, resolution
     }
 
     init(from decoder: Decoder) throws {
@@ -75,8 +78,35 @@ struct ServerFavorite: Codable, Identifiable, Hashable {
         endpointKind = try c.decodeIfPresent(EndpointKind.self, forKey: .endpointKind) ?? .auto
         trustAllCertificates = try c.decodeIfPresent(Bool.self, forKey: .trustAllCertificates) ?? false
         sharePath = try c.decodeIfPresent(String.self, forKey: .sharePath)
+        resolution = try c.decodeIfPresent(RDPResolution.self, forKey: .resolution) ?? .defaultResolution
     }
 }
+
+/// A selectable RDP desktop size, as shown in the session toolbar.
+/// Codable so a favorite can persist the user's preferred starting size.
+struct RDPResolution: Equatable, Identifiable, Hashable, Codable {
+    let width: UInt32
+    let height: UInt32
+
+    var id: String { "\(width)x\(height)" }
+    var displayName: String { "\(width)×\(height)" }
+
+    /// The app-wide default when neither the connect form nor a favorite
+    /// specifies a size.
+    static let defaultResolution = RDPResolution(width: 1280, height: 800)
+
+    static let presets: [RDPResolution] = [
+        RDPResolution(width: 1024, height: 768),
+        RDPResolution(width: 1280, height: 720),
+        RDPResolution(width: 1280, height: 800),
+        RDPResolution(width: 1440, height: 900),
+        RDPResolution(width: 1680, height: 1050),
+        RDPResolution(width: 1920, height: 1080),
+        RDPResolution(width: 2560, height: 1440),
+    ]
+}
+
+/// Connection lifecycle state surfaced to the UI. Kept intentionally tiny so
 
 /// Connection lifecycle state surfaced to the UI. Kept intentionally tiny so
 /// it can back an `AsyncStream<ConnectionState>` without leaking FreeRDP types.

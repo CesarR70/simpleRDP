@@ -28,7 +28,8 @@ final class SessionViewModel: ObservableObject {
                  password: String?,
                  endpointKind: EndpointKind,
                  trustAllCertificates: Bool,
-                 sharePath: String? = nil) {
+                 sharePath: String? = nil,
+                 resolution: RDPResolution? = nil) {
         lastError = nil
         Task {
             do {
@@ -37,7 +38,8 @@ final class SessionViewModel: ObservableObject {
                                           password: password,
                                           endpointKind: endpointKind,
                                           trustAllCertificates: trustAllCertificates,
-                                          sharePath: sharePath)
+                                          sharePath: sharePath,
+                                          resolution: resolution)
             } catch {
                 lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -61,6 +63,7 @@ struct ConnectView: View {
     @State private var endpointKind: EndpointKind = .auto
     @State private var trustAllCertificates: Bool = false
     @State private var sharePath: String = ""
+    @State private var resolution: RDPResolution = .defaultResolution
     @State private var showSaveFavorite: Bool = false
     @State private var editingFavorite: ServerFavorite?
 
@@ -101,6 +104,17 @@ struct ConnectView: View {
                             Picker("", selection: $endpointKind) {
                                 ForEach(EndpointKind.allCases) { kind in
                                     Text(kind.displayName).tag(kind)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .fixedSize()
+                        }
+                        GridRow {
+                            Text("Resolution:")
+                            Picker("", selection: $resolution) {
+                                ForEach(RDPResolution.presets) { res in
+                                    Text(res.displayName).tag(res)
                                 }
                             }
                             .labelsHidden()
@@ -227,7 +241,8 @@ struct ConnectView: View {
                    password: password.isEmpty ? nil : password,
                    endpointKind: endpointKind,
                    trustAllCertificates: trustAllCertificates,
-                   sharePath: sharePath.isEmpty ? nil : sharePath)
+                   sharePath: sharePath.isEmpty ? nil : sharePath,
+                   resolution: resolution)
     }
 
     /// Pre-populate the connect form from a favorite. Does NOT connect — the
@@ -239,6 +254,7 @@ struct ConnectView: View {
         endpointKind = fav.endpointKind
         trustAllCertificates = fav.trustAllCertificates
         sharePath = fav.sharePath ?? ""
+        resolution = fav.resolution
         password = ""
     }
 }
@@ -254,7 +270,7 @@ private struct FavoriteRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(fav.name.isEmpty ? fav.host : fav.name)
                     .font(.body)
-                Text("\(fav.displayHostPort) · \(fav.endpointKind.displayName)")
+                Text("\(fav.displayHostPort) · \(fav.endpointKind.displayName) · \(fav.resolution.displayName)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -320,6 +336,17 @@ private struct FavoriteEditor: View {
                     Picker("", selection: $draft.endpointKind) {
                         ForEach(EndpointKind.allCases) { kind in
                             Text(kind.displayName).tag(kind)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                }
+                GridRow {
+                    Text("Resolution:")
+                    Picker("", selection: $draft.resolution) {
+                        ForEach(RDPResolution.presets) { res in
+                            Text(res.displayName).tag(res)
                         }
                     }
                     .labelsHidden()

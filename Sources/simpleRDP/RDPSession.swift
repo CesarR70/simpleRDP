@@ -153,6 +153,27 @@ actor RDPSession {
     /// is impossible on x86/arm64.
     private nonisolated(unsafe) var stopFlag = false
 
+    /// Pending client-initiated resize. Written by the main actor in
+    /// `setResolution(width:height:)` and consumed/cleared by the event-loop
+    /// thread at the top of its loop, which is the ONLY place that actually
+    /// calls `freerdp_reconnect` — so a resize request can never race the loop
+    /// and tear a connection. Same nonisolated(unsafe) reasoning as stopFlag:
+    /// request is a fire-and-forget from the UI, and the loop drains it once.
+    private nonisolated(unsafe) var resizeWidth: UInt32 = 0
+    private nonisolated(unsafe) var resizeHeight: UInt32 = 0
+    private nonisolated(unsafe) var resizePending = false
+
+    /// Session-reported resolution backing `currentResolution`. Set on connect
+    /// and after each successful resize reconnect, so the status bar reflects
+    /// the negotiated desktop size without depending on EndPaint timing. Same
+    /// nonisolated(unsafe) reasoning as stopFlag: pair of aligned UInt32s written
+    /// once per resize, read by the UI's 30 Hz poll.
+    private nonisolated(unsafe) var currentResolutionValue: RDPResolution?
+
+    /// The resolution the active session is currently running at, readable
+    /// from the UI without an actor hop.
+    nonisolated var currentResolution: RDPResolution? { currentResolutionValue }
+
     // MARK: - Init / deinit
 
     init() {
@@ -192,7 +213,8 @@ actor RDPSession {
                  password: String?,
                  endpointKind: EndpointKind = .auto,
                  trustAllCertificates: Bool = false,
-                 sharePath: String? = nil) async throws {
+                 sharePath: String? = nil,
+                 resolution: RDPResolution? = nil) async throws {
         guard !state.isActive else {
             throw RDPError(message: "Session is already active.", freerdpCode: nil)
         }
@@ -293,11 +315,13 @@ actor RDPSession {
         // (and, on capable servers, file) clipboard formats.
         _ = freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, true)
 
-        // Default desktop size. Mid-session changes are handled by the
-        // DesktopResize callback (gdi_resize), so this is just the starting
-        // resolution.
-        _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, 1280)
-        _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, 800)
+        // Starting desktop size. Mid-session changes are handled by the
+        // DesktopResize callback (gdi_resize), so this is just the negotiated
+        // initial resolution; the user's pre-connect pick comes from the
+        // connect form / favorite, defaulting to RDPResolution.defaultResolution.
+        let startResolution = resolution ?? .defaultResolution
+        _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, startResolution.width)
+        _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, startResolution.height)
 
         // Optional drive redirection (rdpdr): share a Mac folder with the
         // session. On xrdp it appears under ~/thinclient_drives/<name>/.
@@ -384,6 +408,9 @@ actor RDPSession {
         // Input channel is live once the handshake completes.
         input.attach(to: raw)
 
+        // Publish the negotiated starting size for the status bar.
+        currentResolutionValue = startResolution
+
         state = .connected
 
         // 4) Spawn the event-loop thread.
@@ -399,6 +426,25 @@ actor RDPSession {
         thread.name = "simpleRDP.freerdp-loop"
         thread.start()
         self.loopThread = thread
+    }
+
+    /// Request a live change of the ACTIVE session's desktop size.
+    ///
+    /// This only queues the request; the event-loop thread applies it (routes
+    /// through `freerdp_reconnect`), so there is no visible disconnect and the
+    /// session's swap between ConnectView/SessionView is never triggered. The
+    /// chosen resolution is reflected in the status bar via `framebuffer.dimensions`
+    /// once the server negotiates the new size and EndPaint re-publishes.
+    ///
+    /// No-op when the session isn't active. If the server rejects the new size,
+    /// it simply stays at its current resolution — no harm done.
+    func setResolution(width: UInt32, height: UInt32) {
+        guard state == .connected, let raw = instance, raw.pointee.context != nil else { return }
+        // Fire-and-forget: the event-loop thread picks this up on its next
+        // pass (within ~100 ms, the loop's wait timeout).
+        resizeWidth = width
+        resizeHeight = height
+        resizePending = true
     }
 
     /// Tear down the session.
@@ -473,6 +519,18 @@ actor RDPSession {
         let waitFailed: UInt32 = 0xFFFF_FFFF // WAIT_FAILED
 
         while !stopFlag {
+            // Drain any client-initiated resize before touching handles. Applied
+            // here so freerdp_reconnect (which re-establishes the same session at
+            // the new size) runs on THIS thread — the only thread driving the event
+            // loop — never racing freerdp_check_event_handles. The next pass then
+            // waits on the fresh handle set.
+            if resizePending {
+                resizePending = false
+                applyResize(on: raw, ctx: ctx)
+                if stopFlag { break }
+                continue
+            }
+
             let count = freerdp_get_event_handles(ctx, &handles, 64)
             if count == 0 { break } // instance is going away
 
@@ -486,6 +544,28 @@ actor RDPSession {
         Task { [weak self] in
             await self?.markDisconnected()
         }
+    }
+
+    /// Apply a queued resolution change to the live session. Runs on the
+    /// event-loop thread. Updates the stored desktop settings, then asks FreeRDP
+    /// to reconnect the session at the new size; the server replies with a
+    /// Deactivate-Reactivate sequence and the existing DesktopResize callback
+    /// reallocs the GDI surface, after which EndPaint re-publishes the frame at
+    /// the new dimensions.
+    private nonisolated func applyResize(on raw: UnsafeMutablePointer<freerdp>, ctx: UnsafeMutablePointer<rdpContext>) {
+        guard let settings = ctx.pointee.settings else { return }
+        let w = resizeWidth
+        let h = resizeHeight
+        freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, w)
+        freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, h)
+        guard freerdp_reconnect(raw) else {
+            let code = freerdp_get_last_error(ctx)
+            let reason = freerdp_get_last_error_string(code).map { String(cString: $0) } ?? "unknown"
+            print("[RDPSession] resize reconnect failed: \(reason)")
+            return
+        }
+        currentResolutionValue = RDPResolution(width: w, height: h)
+        print("[RDPSession] resize applied at \(w)×\(h)")
     }
 
     private func markDisconnected() {
