@@ -49,10 +49,10 @@ Intel-friendly fallbacks via arch-conditional Homebrew prefixes.
 ## Building from source
 
 This is a Swift Package Manager project — no Xcode IDE required (VS Code with
-the Swift extension works; a `myRDP.code-workspace` file is included).
+the Swift extension works; a `simpleRDP.code-workspace` file is included).
 
 ```bash
-git clone https://github.com/CesarR70/myRDP.git
+git clone https://github.com/CesarR70/simpleRDP.git
 cd myRDP
 brew install freerdp pkg-config
 
