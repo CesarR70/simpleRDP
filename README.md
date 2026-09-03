@@ -32,19 +32,10 @@ clipboard/Finder integration — while libfreerdp does the protocol heavy liftin
 - Status bar shows connection state, live resolution, and clipboard download
   progress (with a cancel button for accidental large copies).
 
-## Requirements
+## Download
 
-- macOS 13 (Ventura) or newer
-- [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`)
-- [Homebrew](https://brew.sh)
-- FreeRDP + pkg-config:
-
-```bash
-brew install freerdp pkg-config
-```
-
-An Apple Silicon Mac (arm64) is the tested build target; the package also has
-Intel-friendly fallbacks via arch-conditional Homebrew prefixes.
+A pre-compiled, portable release for **Apple Silicon Macs** is available for download here:
+[simpleRDP Releases](https://github.com/CesarR70/simpleRDP/releases)
 
 ## Building from source
 
@@ -70,6 +61,20 @@ dependency via pkg-config so a missing/broken install fails with a friendly
 message instead of a wall of clang errors. `Package.swift` resolves FreeRDP
 through pkg-config **plus** arch-conditional Homebrew prefix flags, so even
 SourceKit-LSP in VS Code can build without environment shims.
+
+## Requirements
+
+- macOS 13 (Ventura) or newer
+- [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`)
+- [Homebrew](https://brew.sh)
+- FreeRDP + pkg-config:
+
+```bash
+brew install freerdp pkg-config
+```
+
+An Apple Silicon Mac (arm64) is the tested build target; the package also has
+Intel-friendly fallbacks via arch-conditional Homebrew prefixes.
 
 ### VS Code tasks
 
