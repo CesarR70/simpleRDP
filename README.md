@@ -16,7 +16,9 @@ clipboard/Finder integration — while libfreerdp does the protocol heavy liftin
   copy/paste works in both directions** as well — Mac → server streams file
   contents over the clipboard channel, server → Mac downloads into
   `~/Library/Caches/simpleRDP/RemoteClipboard/` with live progress, then moves
-  the staged files out to a folder you pick. (On xrdp, server-side materializes
+  the staged files out to a folder you pick. Pasting into Finder with **⌥⌘V**
+  ("Move Item Here") also moves them out of the cache; plain ⌘V always
+  copies (Finder decides, not the app). (On xrdp, server-side materializes
   via `~/thinclient_drives`.)
 - **Resolution control:** pick the starting resolution *before* connecting
   (saved per favorite), and **change resolution live** mid-session from the

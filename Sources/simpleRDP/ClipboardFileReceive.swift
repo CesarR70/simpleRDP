@@ -161,16 +161,27 @@ extension ClipboardChannel {
     /// copying — a rename on the same volume is metadata-only, so we avoid
     /// writing the bytes a second time.
     ///
-    /// Note: pasting into another app (Finder ⌘V) still COPIES, because we
-    /// can't intercept another process's paste. This explicit Save-to action
-    /// is the no-double-write path.
+    /// Note on Finder pastes: plain ⌘V in Finder always COPIES — there is no
+    /// pasteboard type a third-party app can set to make Finder move (Finder's
+    /// cut/move state is internal to Finder, and file promises are not honored
+    /// on ⌘V). However, Finder's own "Move Item Here" (⌥⌘V) operates on any
+    /// file URLs on the pasteboard — including ours — and MOVES the staged
+    /// files out of the cache with the same rename-only cost. So the two
+    /// no-double-write paths are: this explicit Save-to action, and ⌥⌘V in
+    /// Finder. After a Finder move, `pruneStagedURLs()` notices the files are
+    /// gone and retires the Save-to button.
     @MainActor
     @discardableResult
     func moveStaged(to destinationDir: URL) -> Bool {
         guard !stagedURLs.isEmpty else { return false }
         let fm = FileManager.default
         var ok = true
+        var movedAny = false
         for src in stagedURLs {
+            // The file may already be gone (e.g. moved out via Finder's ⌥⌘V
+            // between the poll that showed the button and the click). Skip
+            // missing sources instead of reporting a spurious failure.
+            guard fm.fileExists(atPath: src.path) else { continue }
             var dest = destinationDir.appendingPathComponent(src.lastPathComponent)
             // Avoid clobbering an existing file: append -1, -2, …
             var n = 1
@@ -183,15 +194,38 @@ extension ClipboardChannel {
             }
             do {
                 try fm.moveItem(at: src, to: dest) // rename — no second write
+                movedAny = true
                 print("[Clipboard] moved \(src.lastPathComponent) -> \(dest.path)")
             } catch {
                 print("[Clipboard] move failed, falling back to copy: \(error.localizedDescription)")
-                do { try fm.copyItem(at: src, to: dest) } catch { ok = false }
+                do {
+                    try fm.copyItem(at: src, to: dest)
+                    movedAny = true
+                } catch { ok = false }
             }
         }
         stagedURLs = []
         Self.cleanClipboardCache()
-        return ok
+        return ok && movedAny
+    }
+
+    /// Drops staged URLs whose files have already left the cache — e.g. the
+    /// user moved them out via Finder's ⌥⌘V ("Move Item Here") or deleted
+    /// them. Called from SessionView's refresh timer so the "Save to…" button
+    /// disappears once there is nothing left to save, instead of staying
+    /// visible and failing on stale paths.
+    @MainActor
+    func pruneStagedURLs() {
+        guard !stagedURLs.isEmpty else { return }
+        let fm = FileManager.default
+        let surviving = stagedURLs.filter { fm.fileExists(atPath: $0.path) }
+        guard surviving.count != stagedURLs.count else { return }
+        stagedURLs = surviving
+        if surviving.isEmpty {
+            // Nothing left to save: tidy up any empty directory shells the
+            // move left behind in the cache.
+            Self.cleanClipboardCache()
+        }
     }
 
     /// Downloads the server's files into the cache dir, then puts the real

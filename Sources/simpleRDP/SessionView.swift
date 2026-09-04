@@ -104,7 +104,14 @@ struct SessionView: View {
                     } label: {
                         Label("Save to…", systemImage: "arrow.down.doc")
                     }
-                    .help("Move the copied file(s) out of the cache to a folder you choose (move, not copy)")
+                    .help("Move the copied file(s) out of the cache to a folder you choose (move, not copy). In Finder, ⌥⌘V (“Move Item Here”) also moves instead of copying.")
+
+                    // Remind the user the Save-to button is optional:
+                    // ⌥⌘V in a Finder folder moves the staged file(s)
+                    // out of the cache just the same.
+                    Text("Hint: press ⌥⌘V in a Finder folder to move it there")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
 
                 Text("⌘-shortcuts stay on the Mac · Ctrl-click = right-click")
@@ -124,6 +131,9 @@ struct SessionView: View {
             }
             let status = clipboard.currentDownloadStatus()
             if status != downloadStatus { downloadStatus = status }
+            // Retire the Save-to button if the staged files already left the
+            // cache (e.g. moved out via Finder's ⌥⌘V "Move Item Here").
+            clipboard.pruneStagedURLs()
             let staged = clipboard.hasStagedFiles
             if staged != hasStagedFiles { hasStagedFiles = staged }
         }

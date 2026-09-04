@@ -36,9 +36,12 @@ mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources" "${APP}/Contents/Fr
 
 cp "$BIN" "${APP}/Contents/MacOS/${APP_NAME}"
 
-# Info.plist: use a checked-in one if present, else generate a minimal default.
+# Info.plist: use a checked-in one if present (repo root first, then the
+# target source dir), else generate a minimal default.
 if [[ -f "Info.plist" ]]; then
   cp "Info.plist" "${APP}/Contents/Info.plist"
+elif [[ -f "Sources/${APP_NAME}/Info.plist" ]]; then
+  cp "Sources/${APP_NAME}/Info.plist" "${APP}/Contents/Info.plist"
 else
   echo "==> No Info.plist found; generating a minimal default."
   cat > "${APP}/Contents/Info.plist" <<PLIST
@@ -50,7 +53,7 @@ else
     <key>CFBundleIdentifier</key>        <string>com.example.${APP_NAME}</string>
     <key>CFBundleName</key>              <string>${APP_NAME}</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.1</string>
     <key>CFBundleVersion</key>           <string>1</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
@@ -67,7 +70,7 @@ fi
 
 # --- Optional: vendor Homebrew dylibs for portability -----------------------
 # Toggle by setting VENDOR_DYLIBS=1 in the environment. Off by default because
-# for local dev, linking against the Homebrew prefix works fine.
+ the Homebrew prefix works fine.
 if [[ "${VENDOR_DYLIBS:-0}" == "1" ]]; then
   "${ROOT}/Scripts/vendor_dylibs.sh" "${APP}"
 fi

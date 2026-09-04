@@ -18,13 +18,14 @@ workspace-state.json
 
 # Compiled .app bundle (rebuilt by Scripts/bundle.sh)
 simpleRDP.app/
-simpleRDP.zip
+simpleRDP*.zip
 
 # Superseded/backup icon (source of truth is Resources/AppIcon.icns)
 Resources/old-AppIcon.icns
 
-# Ignore LLM .md plan and vscode workspace
+# Ignore LLM .md plan, agent memory bank, and vscode workspace
 RDP-Swift-Client-Plan.md
+memory-bank/
 
 # SwiftPM — commit this for apps to lock dependency versions
 # Package.resolved
