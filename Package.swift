@@ -64,6 +64,15 @@ let package = Package(
                 .linkedLibrary("freerdp-client3"),
                 .linkedLibrary("winpr3"),
             ]
+        ),
+        .testTarget(
+            name: "simpleRDPTests",
+            dependencies: ["simpleRDP", "CFreeRDP"],
+            cSettings: [.unsafeFlags([
+                "-I\(brewPrefix)/include/freerdp3",
+                "-I\(brewPrefix)/include/winpr3",
+            ])],
+            linkerSettings: [.unsafeFlags(["-L\(brewPrefix)/lib"])]
         )
     ]
 )

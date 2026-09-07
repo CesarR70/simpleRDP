@@ -53,8 +53,8 @@ else
     <key>CFBundleIdentifier</key>        <string>com.example.${APP_NAME}</string>
     <key>CFBundleName</key>              <string>${APP_NAME}</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1</string>
-    <key>CFBundleVersion</key>           <string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.2</string>
+    <key>CFBundleVersion</key>           <string>3</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
@@ -67,16 +67,20 @@ fi
 if [[ -f "Resources/AppIcon.icns" ]]; then
   cp "Resources/AppIcon.icns" "${APP}/Contents/Resources/AppIcon.icns"
 fi
+cp LICENSE "${APP}/Contents/Resources/LICENSE"
+cp RELEASE-NOTES-1.2.md "${APP}/Contents/Resources/ReleaseNotes.md"
 
 # --- Optional: vendor Homebrew dylibs for portability -----------------------
 # Toggle by setting VENDOR_DYLIBS=1 in the environment. Off by default because
- the Homebrew prefix works fine.
+# the Homebrew prefix works fine for local builds.
 if [[ "${VENDOR_DYLIBS:-0}" == "1" ]]; then
   "${ROOT}/Scripts/vendor_dylibs.sh" "${APP}"
+  python3 "${ROOT}/Scripts/verify_bundle.py" "${APP}"
 fi
 # ---------------------------------------------------------------------------
 
 echo "==> Ad-hoc code signing"
 codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "==> Done: ${ROOT}/${APP}"

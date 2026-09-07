@@ -24,9 +24,11 @@ set -euo pipefail
 APP="${1:-simpleRDP.app}"
 BIN="$APP/Contents/MacOS/simpleRDP"
 FW="$APP/Contents/Frameworks"
+NOTICES="$APP/Contents/Resources/ThirdPartyLicenses"
 
 [[ -f "$BIN" ]] || { echo "error: $BIN not found" >&2; exit 1; }
 mkdir -p "$FW"
+mkdir -p "$NOTICES"
 
 BREW="$(brew --prefix)"
 
@@ -40,7 +42,7 @@ PAIRS=$(python3 - "$BIN" "$BREW" <<'PYEOF'
 import subprocess, re, os, sys
 root, brew = sys.argv[1], sys.argv[2]
 def refs(p):
-    out = subprocess.run(["otool","-L",p], capture_output=True, text=True).stdout
+    out = subprocess.run(["otool","-L",p], capture_output=True, text=True, check=True).stdout
     r = []
     for line in out.splitlines()[1:]:
         m = re.match(r"^\s+(/\S+)\s+\(", line)
@@ -67,6 +69,25 @@ PYEOF
 COUNT=$(echo "$PAIRS" | grep -c .)
 echo "==> Vendoring $COUNT dylibs (copied under their referenced names)"
 
+# Preserve the license/notice files supplied by installed formulae alongside
+# the bundled libraries. The dependency manifest records the binary closure.
+printf '%s\n' "$PAIRS" | python3 -c '
+import pathlib, shutil, sys
+destination = pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+    real = pathlib.Path(line.split("\t", 1)[0])
+    parts = real.parts
+    if "Cellar" not in parts:
+        continue
+    i = parts.index("Cellar")
+    prefix = pathlib.Path(*parts[:i+3])
+    out = destination / (parts[i+1] + "-" + parts[i+2])
+    out.mkdir(exist_ok=True)
+    for item in prefix.iterdir():
+        if item.is_file() and item.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE", "AUTHORS")):
+            shutil.copy2(item, out / item.name)
+' "$NOTICES"
+
 # Pass 1: copy each lib into Frameworks under its REFERENCED basename and set
 # its install-name ID to @rpath/<referenced-basename>.
 while IFS=$'\t' read -r real ref; do
@@ -86,7 +107,7 @@ relink() {
         base="$(basename "$ref")"
         # Only rewrite if this exact reference string is present in target.
         if otool -L "$target" | grep -qF "$ref ("; then
-            install_name_tool -change "$ref" "@rpath/$base" "$target" 2>/dev/null || true
+            install_name_tool -change "$ref" "@rpath/$base" "$target"
         fi
     done <<< "$PAIRS"
 }

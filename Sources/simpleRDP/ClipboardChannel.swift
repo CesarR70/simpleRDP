@@ -4,13 +4,12 @@
 //   - Mac → server: text AND file copy/paste (FileGroupDescriptorW +
 //     FileContents streaming — the same PDUs xrdp's chansrv consumes when it
 //     materializes files under ~/thinclient_drives/.clipboard/).
-//   - Server → Mac: text (fetched eagerly when the server announces a format
-//     list; server-side files are left for a later milestone).
+//   - Server → Mac: text and validated per-transfer file staging.
 //
-// Threading: channel callbacks arrive on FreeRDP's event-loop thread.
+// Threading: callbacks arrive on FreeRDP/channel worker threads.
 // NSPasteboard is only touched on the main thread (callbacks hop via
 // DispatchQueue.main). Channel *send* functions converge on transport_write,
-// which is internally locked in FreeRDP 3.x — same story as RemoteInput.
+// with complete sends guarded by sendLock so detach excludes in-flight sends.
 //
 // Discovery: the cliprdr channel add-in creates its CliprdrClientContext
 // during freerdp_connect. We learn about it via the PubSub
@@ -29,6 +28,21 @@ final class ClipboardChannel: @unchecked Sendable {
     static let fileContentsFormatId: UInt32       = 0xC002 // "FileContents"
 
     let lock = NSLock()
+    // Always acquire sendLock before lock when both are required. Detach waits
+    // for synchronous sends before allowing FreeRDP to destroy the interface.
+    let sendLock = NSRecursiveLock()
+    var remoteGeneration = Foundation.UUID()
+    var currentTransfer: ClipboardTransfer?
+    var stagedDirectory: URL?
+    var stagedPasteboardChange = -1
+    struct FormatRequest {
+        let kind: ClipboardDataRequestKind
+        let formatID: UInt32
+        let generation: Foundation.UUID
+        let pasteboardChange: Int
+    }
+    var pendingFormat: FormatRequest?
+    var queuedFormat: FormatRequest?
 
     /// The channel's client context. Valid while the channel is connected.
     var clip: UnsafeMutablePointer<CliprdrClientContext>?
@@ -37,20 +51,10 @@ final class ClipboardChannel: @unchecked Sendable {
     var serverGeneralFlags: UInt32 = 0
     var sawServerCapabilities = false
 
-    /// Files captured when we last announced a file list; streamId == index.
+    /// Files captured when we last announced a file list; listIndex selects one.
     var servedFiles: [ServedFile] = []
 
     // MARK: - Server → Mac receive state
-
-    /// Server-assigned format ID for "FileGroupDescriptorW" in the most recent
-    /// server format list (nil when the server clipboard holds no files).
-    var remoteFileGroupFormatId: UInt32?
-
-    /// Flattened file list from the server's last FileGroupDescriptorW.
-    var remoteFiles: [RemoteClipboardFile] = []
-
-    /// What our outstanding ClientFormatDataRequest asked for.
-    var pendingDataRequest: ClipboardDataRequestKind?
 
     /// In-flight ClientFileContentsRequests, keyed by streamId.
     var pendingContents: [UInt32: (Data?) -> Void] = [:]
@@ -71,49 +75,11 @@ final class ClipboardChannel: @unchecked Sendable {
     /// (Stored here, not in ClipboardFileReceive.swift's extension — Swift
     /// extensions cannot hold stored properties. Setter is internal because the
     /// writes live in ClipboardFileReceive.swift.)
-    internal(set) var stagedURLs: [URL] = []
+    var stagedURLs: [URL] = []
 
     /// Download progress snapshot for the UI. Guarded by `lock`; SessionView
     /// polls it on its existing refresh timer (no observation machinery).
-    private var downloadStatus = ClipboardDownloadStatus()
-
-    /// Cooperative-cancellation flag for in-flight downloads. Guarded by
-    /// `lock`; checked between chunks in the download loop so a cancelled
-    /// large copy stops promptly (cancelling the OperationQueue alone won't
-    /// interrupt a blocking downloadToFile that's already running).
-    private var downloadCancelled = false
-
-    var isDownloadCancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return downloadCancelled
-    }
-
-    /// Cancel any in-progress server→Mac download and clear the staged cache.
-    /// Safe to call from the main thread (the Cancel button).
-    func cancelDownloads() {
-        lock.lock()
-        downloadCancelled = true
-        let pending = pendingContents
-        pendingContents.removeAll()
-        lock.unlock()
-        // Interrupt any blocking requestFileContentsSync semaphores.
-        for handler in pending.values { handler(nil) }
-        fileDownloadQueue.cancelAllOperations()
-        updateDownloadStatus { $0 = .idle }
-        DispatchQueue.main.async {
-            self.stagedURLs = []
-            Self.cleanClipboardCache()
-        }
-        print("[Clipboard] download cancelled by user; cache cleared")
-    }
-
-    /// Reset the cancellation flag when a new download begins.
-    func resetDownloadCancellation() {
-        lock.lock()
-        downloadCancelled = false
-        lock.unlock()
-    }
+    var downloadStatus = ClipboardDownloadStatus()
 
     func currentDownloadStatus() -> ClipboardDownloadStatus {
         lock.lock()
@@ -140,6 +106,8 @@ final class ClipboardChannel: @unchecked Sendable {
 
     /// Called from the PubSub ChannelConnected handler (event-loop thread).
     func attach(_ clip: UnsafeMutablePointer<CliprdrClientContext>) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         lock.lock()
         self.clip = clip
         serverGeneralFlags = 0
@@ -150,25 +118,28 @@ final class ClipboardChannel: @unchecked Sendable {
         clip.pointee.custom = Unmanaged.passUnretained(self).toOpaque()
         installClipboardCallbacks(on: clip)
 
-        DispatchQueue.main.async { self.startMonitoring() }
+        DispatchQueue.main.async { if self.clipSnapshot() != nil { self.startMonitoring() } }
     }
 
     /// Called on disconnect / channel teardown. Idempotent.
     func detach() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         lock.lock()
         clip = nil
+        remoteGeneration = Foundation.UUID()
+        currentTransfer?.cancel()
+        currentTransfer = nil
+        pendingFormat = nil
+        queuedFormat = nil
         servedFiles = []
-        remoteFileGroupFormatId = nil
-        remoteFiles = []
-        pendingDataRequest = nil
         let pending = pendingContents
         pendingContents.removeAll()
         lock.unlock()
         // Fail any in-flight downloads so their semaphores release.
-        fileDownloadQueue.cancelAllOperations()
         updateDownloadStatus { $0 = .idle }
         for handler in pending.values { handler(nil) }
-        DispatchQueue.main.async { self.stopMonitoring() }
+        DispatchQueue.main.async { if self.clipSnapshot() == nil { self.stopMonitoring() } }
     }
 
     func clipSnapshot() -> UnsafeMutablePointer<CliprdrClientContext>? {
@@ -196,6 +167,11 @@ final class ClipboardChannel: @unchecked Sendable {
         let pb = NSPasteboard.general
         guard pb.changeCount != lastChangeCount else { return }
         lastChangeCount = pb.changeCount
+        cancelDownloads()
+        lock.lock()
+        remoteGeneration = Foundation.UUID()
+        queuedFormat = nil
+        lock.unlock()
         announceLocalFormats()
     }
 
@@ -227,7 +203,8 @@ struct ServedFile {
         self.size = UInt64(values.fileSize ?? 0)
         self.isReadOnly = !(values.isWritable ?? true)
         let modified = values.contentModificationDate ?? Date()
-        self.lastWriteTime = UInt64((modified.timeIntervalSince1970 + 11_644_473_600) * 10_000_000)
+        let ticks = (modified.timeIntervalSince1970 + 11_644_473_600) * 10_000_000
+        self.lastWriteTime = ticks >= 0 && ticks < Double(UInt64.max) ? UInt64(ticks) : 0
     }
 }
 
@@ -284,6 +261,8 @@ extension ClipboardChannel {
     /// without it), then eagerly fetch the payload descriptor: files win over
     /// text (a file copy usually also offers a path-list text form).
     func onServerFormatList(_ list: CLIPRDR_FORMAT_LIST) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         if let clip = clipSnapshot() {
             var response = CLIPRDR_FORMAT_LIST_RESPONSE()
             response.common.msgFlags = UInt16(CB_RESPONSE_OK)
@@ -307,24 +286,39 @@ extension ClipboardChannel {
             }
         }
 
+        cancelDownloads()
         lock.lock()
-        remoteFileGroupFormatId = fileGroupId
+        let generation = Foundation.UUID()
+        remoteGeneration = generation
+        queuedFormat = nil
         lock.unlock()
+        DispatchQueue.main.async { [self] in
+            let kind: ClipboardDataRequestKind
+            let id: UInt32
+            if let fileGroupId { kind = .fileGroup; id = fileGroupId }
+            else if offersUnicodeText { kind = .text; id = UInt32(CF_UNICODETEXT) }
+            else { return }
+            enqueueFormat(FormatRequest(kind: kind, formatID: id, generation: generation,
+                                        pasteboardChange: NSPasteboard.general.changeCount))
+        }
+    }
 
+    private func enqueueFormat(_ request: FormatRequest) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        lock.lock()
+        guard remoteGeneration == request.generation, clip != nil else { lock.unlock(); return }
+        if pendingFormat != nil { queuedFormat = request; lock.unlock(); return }
+        pendingFormat = request
+        lock.unlock()
         guard let clip = clipSnapshot() else { return }
-        var request = CLIPRDR_FORMAT_DATA_REQUEST()
-        if let fileGroupId {
+        var pdu = CLIPRDR_FORMAT_DATA_REQUEST()
+        pdu.requestedFormatId = request.formatID
+        if clip.pointee.ClientFormatDataRequest?(clip, &pdu) != 0 {
             lock.lock()
-            pendingDataRequest = .fileGroup
+            pendingFormat = nil
             lock.unlock()
-            request.requestedFormatId = fileGroupId
-            _ = clip.pointee.ClientFormatDataRequest?(clip, &request)
-        } else if offersUnicodeText {
-            lock.lock()
-            pendingDataRequest = .text
-            lock.unlock()
-            request.requestedFormatId = UInt32(CF_UNICODETEXT)
-            _ = clip.pointee.ClientFormatDataRequest?(clip, &request)
+            reportClipboardError(ValidationError("Unable to request clipboard data."), generation: request.generation)
         }
     }
 
@@ -344,39 +338,44 @@ extension ClipboardChannel {
     /// to the Mac pasteboard.
     func onServerFormatDataResponse(_ response: CLIPRDR_FORMAT_DATA_RESPONSE) {
         lock.lock()
-        let kind = pendingDataRequest
-        pendingDataRequest = nil
+        let request = pendingFormat
+        pendingFormat = nil
+        let next = queuedFormat
+        queuedFormat = nil
+        let generation = remoteGeneration
         lock.unlock()
-
-        guard response.common.msgFlags & UInt16(CB_RESPONSE_OK) != 0,
+        defer { if let next { enqueueFormat(next) } }
+        guard let request, request.generation == generation,
+              response.common.msgFlags & UInt16(CB_RESPONSE_OK) != 0,
               let bytes = response.requestedFormatData,
-              response.common.dataLen > 0 else { return }
-        // Copy now — the pointer is only valid for the duration of the callback.
+              response.common.dataLen > 0, response.common.dataLen <= 16 * 1024 * 1024 else { return }
         let data = Data(bytes: bytes, count: Int(response.common.dataLen))
-
-        switch kind {
+        switch request.kind {
         case .fileGroup:
-            let files = parseFileGroupDescriptor(data)
-            lock.lock()
-            remoteFiles = files
-            lock.unlock()
-            DispatchQueue.main.async { self.offerRemoteFiles(files) }
-
-        case .text, nil:
-            guard data.count > 1 else { return }
-            var units = [UInt16]()
-            units.reserveCapacity(data.count / 2)
-            for i in stride(from: 0, to: data.count - 1, by: 2) {
-                units.append(UInt16(data[i]) | UInt16(data[i + 1]) << 8)
+            do {
+                let files = try parseFileGroupDescriptor(data)
+                DispatchQueue.main.async { [self] in
+                    offerRemoteFiles(files, generation: generation, pasteboardChange: request.pasteboardChange)
+                }
+            } catch { reportClipboardError(error, generation: generation) }
+        case .text:
+            guard data.count % 2 == 0 else { return }
+            var units: [UInt16] = []
+            for i in stride(from: 0, to: data.count, by: 2) {
+                let unit = UInt16(data[i]) | UInt16(data[i + 1]) << 8
+                if unit == 0 { break }
+                units.append(unit)
             }
-            if units.last == 0 { units.removeLast() } // trailing NUL
-            let string = String(utf16CodeUnits: units, count: units.count)
-
-            DispatchQueue.main.async {
+            let string = String(decoding: units, as: UTF16.self)
+            DispatchQueue.main.async { [self] in
+                lock.lock()
+                let valid = remoteGeneration == generation && clip != nil
+                lock.unlock()
                 let pb = NSPasteboard.general
+                guard valid, pb.changeCount == request.pasteboardChange else { return }
                 pb.clearContents()
                 pb.setString(string, forType: .string)
-                self.swallowPasteboardChange() // don't echo this back to the server
+                swallowPasteboardChange()
             }
         }
     }
@@ -393,6 +392,10 @@ extension ClipboardChannel {
             let data = withUnsafeBytes(of: &size) { Data($0) }
             respondFileContents(streamId: request.streamId, data: data, ok: file != nil)
         } else if request.dwFlags & UInt32(FILECONTENTS_RANGE) != 0, let file {
+            guard request.cbRequested <= 4 * 1024 * 1024 else {
+                respondFileContents(streamId: request.streamId, data: Data(), ok: false)
+                return
+            }
             let offset = UInt64(request.nPositionHigh) << 32 | UInt64(request.nPositionLow)
             if let data = Self.readFileRange(url: file.url, offset: offset,
                                              count: Int(request.cbRequested)) {
@@ -444,6 +447,8 @@ extension ClipboardChannel {
     }
 
     private func sendCapabilities() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         guard let clip = clipSnapshot() else { return }
         var general = CLIPRDR_GENERAL_CAPABILITY_SET()
         general.capabilitySetType = UInt16(CB_CAPSTYPE_GENERAL)
@@ -463,6 +468,8 @@ extension ClipboardChannel {
     }
 
     private func sendFormatList(_ entries: [(id: UInt32, name: String?)]) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         guard let clip = clipSnapshot() else { return }
         // The channel marshals the PDU synchronously, so the strdup'd names
         // can be freed right after the call returns.
@@ -506,6 +513,8 @@ extension ClipboardChannel {
     }
 
     private func respondFormatData(_ data: Data) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         guard let clip = clipSnapshot() else { return }
         data.withUnsafeBytes { raw in
             var response = CLIPRDR_FORMAT_DATA_RESPONSE()
@@ -517,6 +526,8 @@ extension ClipboardChannel {
     }
 
     private func respondFormatDataFailure() {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         guard let clip = clipSnapshot() else { return }
         var response = CLIPRDR_FORMAT_DATA_RESPONSE()
         response.common.msgFlags = UInt16(CB_RESPONSE_FAIL)
@@ -525,6 +536,8 @@ extension ClipboardChannel {
     }
 
     private func respondFileContents(streamId: UInt32, data: Data, ok: Bool) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         guard let clip = clipSnapshot() else { return }
         data.withUnsafeBytes { raw in
             var response = CLIPRDR_FILE_CONTENTS_RESPONSE()
@@ -547,7 +560,7 @@ extension ClipboardChannel {
     static func makeFileGroupDescriptor(_ files: [ServedFile]) -> Data {
         // flags: FD_ATTRIBUTES | FD_FILESIZE | FD_WRITESTIME | FD_UNICODE | FD_PROGRESSUI
         let descriptorFlags: UInt32 = 0x0000_0004 | 0x0000_0040 | 0x0000_0020
-                                      | 0x0000_0200 | 0x0000_4000
+                                      | 0x8000_0000 | 0x0000_4000
 
         var bytes = [UInt8]()
         bytes.reserveCapacity(4 + files.count * 592)

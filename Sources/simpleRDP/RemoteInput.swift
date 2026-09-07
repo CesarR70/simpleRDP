@@ -18,7 +18,7 @@ import Foundation
 import CFreeRDP
 
 /// Mouse buttons, in RDP terms.
-enum RemoteMouseButton {
+enum RemoteMouseButton: Hashable {
     case left, right, middle
 }
 
@@ -58,6 +58,8 @@ final class RemoteInput: @unchecked Sendable {
     /// Keys currently held down. Used to release everything on focus loss or
     /// disconnect so the server never sees a stuck key.
     private var pressed: Set<UInt32> = []
+    private var pressedButtons: Set<RemoteMouseButton> = []
+    private var lastPointer = (x: 0, y: 0)
 
     // MARK: - Lifecycle (called from RDPSession)
 
@@ -65,6 +67,7 @@ final class RemoteInput: @unchecked Sendable {
         lock.lock()
         input = instance.pointee.context?.pointee.input
         pressed.removeAll()
+        pressedButtons.removeAll()
         lock.unlock()
     }
 
@@ -72,6 +75,7 @@ final class RemoteInput: @unchecked Sendable {
         lock.lock()
         input = nil
         pressed.removeAll()
+        pressedButtons.removeAll()
         lock.unlock()
     }
 
@@ -92,13 +96,18 @@ final class RemoteInput: @unchecked Sendable {
             }
         }
         pressed.removeAll()
+        for button in pressedButtons {
+            _ = freerdp_input_send_mouse_event(input, PTR.buttonFlag(button),
+                                               UInt16(clamping: lastPointer.x), UInt16(clamping: lastPointer.y))
+        }
+        pressedButtons.removeAll()
     }
 
     // MARK: - Keyboard
 
     /// Press or release a physical key, addressed by macOS virtual keyCode.
     /// Unmapped printable keys fall back to a Unicode keyboard PDU.
-    func sendKey(_ keyCode: UInt16, down: Bool, characters: String?) {
+    func sendKey(_ keyCode: UInt16, down: Bool, characters: String?, allowRepeat: Bool = true) {
         lock.lock()
         defer { lock.unlock() }
         guard let input else { return }
@@ -107,7 +116,7 @@ final class RemoteInput: @unchecked Sendable {
             let tag = UInt32(mapped.code) | (mapped.extended ? Self.extendedTag : 0)
             // Dedupe: flagsChanged reports modifier "down" on every modifier
             // transition, not just for the key that changed.
-            if down, pressed.contains(tag) { return }
+            if down, !allowRepeat, pressed.contains(tag) { return }
             if !down, !pressed.contains(tag) { return }
             var flags: UInt16 = down ? KBD.down : KBD.release
             if mapped.extended { flags |= KBD.extended }
@@ -133,26 +142,37 @@ final class RemoteInput: @unchecked Sendable {
     }
 
     func mouseButton(_ button: RemoteMouseButton, down: Bool, x: Int, y: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let input else { return }
         var flags = PTR.buttonFlag(button)
         if down { flags |= PTR.down }
-        sendPointer(flags: flags, x: x, y: y)
+        if down { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
+        lastPointer = (x, y)
+        _ = freerdp_input_send_mouse_event(input, flags, UInt16(clamping: x), UInt16(clamping: y))
     }
 
     /// steps: signed number of wheel notches (positive = up / left).
     func mouseWheel(steps: Int32, horizontal: Bool, x: Int, y: Int) {
-        guard steps != 0 else { return }
-        var flags: UInt16 = horizontal ? PTR.hwheel : PTR.wheel
-        // One notch == 120 units, capped at the 9-bit WheelRotationMask.
-        let rotation = min(abs(steps) * 120, PTR.wheelMask)
-        if steps < 0 { flags |= PTR.wheelNegative }
-        flags |= UInt16(rotation)
-        sendPointer(flags: flags, x: x, y: y)
+        for flags in Self.wheelFlags(steps: steps, horizontal: horizontal) {
+            sendPointer(flags: flags, x: x, y: y)
+        }
+    }
+
+    static func wheelFlags(steps: Int32, horizontal: Bool) -> [UInt16] {
+        // Nine-bit signed two's complement, not sign-magnitude. Bound extreme
+        // input and split into whole notches so positive values never set bit 8.
+        let notches = min(abs(Int64(steps)), 100)
+        let rotation: Int16 = steps < 0 ? -120 : 120
+        let flags = (horizontal ? PTR.hwheel : PTR.wheel) | (UInt16(bitPattern: rotation) & 0x01ff)
+        return Array(repeating: flags, count: Int(notches))
     }
 
     private func sendPointer(flags: UInt16, x: Int, y: Int) {
         lock.lock()
         defer { lock.unlock() }
         guard let input else { return }
+        lastPointer = (x, y)
         _ = freerdp_input_send_mouse_event(input, flags,
                                            UInt16(clamping: x), UInt16(clamping: y))
     }

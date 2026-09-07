@@ -46,6 +46,8 @@ final class RemoteDesktopNSView: NSView {
     private var lastMoveSent = Date.distantPast
     private var wheelRemainder = CGPoint.zero
     private var resignObserver: NSObjectProtocol?
+    private var leftPressButton: RemoteMouseButton = .left
+    private var heldModifiers: Set<UInt16> = []
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -67,6 +69,7 @@ final class RemoteDesktopNSView: NSView {
             queue: .main
         ) { [weak self] _ in
             self?.input?.releaseAllKeys()
+            self?.heldModifiers.removeAll()
         }
         // Grab keyboard focus as soon as we're in a window.
         DispatchQueue.main.async { window.makeFirstResponder(self) }
@@ -80,6 +83,7 @@ final class RemoteDesktopNSView: NSView {
 
     override func resignFirstResponder() -> Bool {
         input?.releaseAllKeys()
+        heldModifiers.removeAll()
         return super.resignFirstResponder()
     }
 
@@ -149,12 +153,12 @@ final class RemoteDesktopNSView: NSView {
         window?.makeFirstResponder(self)
         // Mac convention: Ctrl-click == right-click.
         let button: RemoteMouseButton = event.modifierFlags.contains(.control) ? .right : .left
+        leftPressButton = button
         sendButton(button, down: true, event: event)
     }
 
     override func mouseUp(with event: NSEvent) {
-        let button: RemoteMouseButton = event.modifierFlags.contains(.control) ? .right : .left
-        sendButton(button, down: false, event: event)
+        sendButton(leftPressButton, down: false, event: event)
     }
 
     override func rightMouseDown(with event: NSEvent) { sendButton(.right, down: true, event: event) }
@@ -214,6 +218,7 @@ final class RemoteDesktopNSView: NSView {
     // MARK: - Keyboard
 
     override func keyDown(with event: NSEvent) {
+        guard !event.modifierFlags.contains(.command) else { super.keyDown(with: event); return }
         input?.sendKey(event.keyCode, down: true, characters: event.characters)
     }
 
@@ -224,16 +229,24 @@ final class RemoteDesktopNSView: NSView {
     override func flagsChanged(with event: NSEvent) {
         // Modifier keys don't generate keyDown/keyUp; derive the new state
         // from modifierFlags for whichever modifier this keyCode belongs to.
-        let isDown: Bool
+        let aggregateDown: Bool
         switch event.keyCode {
-        case 0x38, 0x3C: isDown = event.modifierFlags.contains(.shift)
-        case 0x3B, 0x3E: isDown = event.modifierFlags.contains(.control)
-        case 0x3A, 0x3D: isDown = event.modifierFlags.contains(.option)
-        case 0x37, 0x36: isDown = event.modifierFlags.contains(.command)
-        case 0x39:       isDown = event.modifierFlags.contains(.capsLock)
+        case 0x38, 0x3C: aggregateDown = event.modifierFlags.contains(.shift)
+        case 0x3B, 0x3E: aggregateDown = event.modifierFlags.contains(.control)
+        case 0x3A, 0x3D: aggregateDown = event.modifierFlags.contains(.option)
+        case 0x37, 0x36: return // Command remains local.
+        case 0x39:
+            // Caps Lock is a toggle, not a key held until the next toggle.
+            input?.sendKey(event.keyCode, down: true, characters: nil)
+            input?.sendKey(event.keyCode, down: false, characters: nil)
+            return
         default:         return // e.g. Fn — no RDP equivalent
         }
-        input?.sendKey(event.keyCode, down: isDown, characters: nil)
+        // Command is reserved for the Mac; never send a stray Windows-key tap
+        // when AppKit handles a local menu shortcut.
+        let isDown = aggregateDown && !heldModifiers.contains(event.keyCode)
+        if isDown { heldModifiers.insert(event.keyCode) } else { heldModifiers.remove(event.keyCode) }
+        input?.sendKey(event.keyCode, down: isDown, characters: nil, allowRepeat: false)
     }
 }
 

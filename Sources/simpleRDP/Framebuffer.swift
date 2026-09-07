@@ -33,7 +33,15 @@ final class Framebuffer: @unchecked Sendable {
         return width > 0 ? (width, height) : nil
     }
 
-    deinit { free(pixels) }
+    deinit { pixels?.deallocate() }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        width = 0
+        height = 0
+        revision &+= 1
+    }
 
     /// Called from the EndPaint callback (FreeRDP dispatch thread). Copies the
     /// full GDI primary buffer — BGRA32, top-down in FreeRDP 3.x — into our
@@ -51,7 +59,7 @@ final class Framebuffer: @unchecked Sendable {
 
         let needed = w * h * 4
         if needed > capacity {
-            free(pixels)
+            pixels?.deallocate()
             pixels = UnsafeMutableRawPointer.allocate(byteCount: needed, alignment: 16)
             capacity = needed
         }
@@ -80,7 +88,9 @@ final class Framebuffer: @unchecked Sendable {
         let count = width * height * 4
         let copy = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
         memcpy(copy, pixels, count)
-        let data = Data(bytesNoCopy: copy, count: count, deallocator: .free)
+        let data = Data(bytesNoCopy: copy, count: count, deallocator: .custom { pointer, _ in
+            pointer.deallocate()
+        })
 
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
 

@@ -13,6 +13,8 @@ import Combine
 @MainActor
 final class FavoritesStore: ObservableObject {
     @Published private(set) var favorites: [ServerFavorite] = []
+    @Published var lastError: String?
+    private var loadFailed = false
 
     private let fileURL: URL
     private let encoder: JSONEncoder = {
@@ -78,11 +80,17 @@ final class FavoritesStore: ObservableObject {
         } catch {
             // Don't crash on a malformed file; just start fresh and surface to console.
             print("[FavoritesStore] failed to decode \(fileURL.path): \(error)")
+            loadFailed = true
+            lastError = "Favorites could not be read. The original file has been preserved at \(fileURL.path). \(error.localizedDescription)"
             self.favorites = []
         }
     }
 
     private func persist() {
+        guard !loadFailed else {
+            lastError = "The existing favorites file could not be loaded. It has not been overwritten. Repair or back up \(fileURL.path), then restart the app."
+            return
+        }
         let dir = fileURL.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: dir,
@@ -91,6 +99,7 @@ final class FavoritesStore: ObservableObject {
             try data.write(to: fileURL, options: .atomic)
         } catch {
             print("[FavoritesStore] failed to persist favorites: \(error)")
+            lastError = error.localizedDescription
         }
     }
 

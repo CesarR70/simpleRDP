@@ -1,178 +1,92 @@
-//
-// SessionView.swift — live view of the active RDP session.
-//
-// Polls the session's Framebuffer at ~30 Hz and paints the latest CGImage.
-// The Framebuffer is fed by FreeRDP's EndPaint callback on the event-loop
-// thread and is lock-protected, so polling here is safe and cheap (no copy
-// happens unless the frame changed).
-//
-// View-only for now: mouse/keyboard capture is the next Milestone 2 chunk.
-//
-
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct SessionView: View {
-    let state: ConnectionState
-    let framebuffer: Framebuffer
-    let input: RemoteInput
-    let clipboard: ClipboardChannel
-    let onDisconnect: () -> Void
-    let onResize: (UInt32, UInt32) -> Void
-    /// Session-reported current resolution (set on connect and after each
-    /// successful resize reconnect). Polled by `statusText` on every refresh-
-    /// timer repaint, so the status bar tracks resizes immediately instead of
-    /// waiting for the first EndPaint at the new size.
-    let currentResolution: () -> RDPResolution?
-
+    @ObservedObject var vm: SessionViewModel
     @State private var image: CGImage?
     @State private var lastRevision: UInt64 = 0
-    @State private var downloadStatus = ClipboardDownloadStatus()
-    @State private var hasStagedFiles = false
-    @State private var showSavePanel = false
-
-    private let refreshTimer = Timer.publish(every: 1.0 / 30.0,
-                                             on: .main,
-                                             in: .common).autoconnect()
+    @State private var download = ClipboardDownloadStatus()
+    @State private var hasFiles = false
+    @State private var showFiles = false
+    @State private var error: String?
+    @State private var dimensions: RDPResolution?
+    private let frames = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
+    private let status = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                // The NSView draws the frame AND captures input, so pointer
-                // coordinate mapping and pixel placement always agree.
-                RemoteDesktopView(image: image, input: input)
-                if image == nil {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.large)
-                        Text("Waiting for the first frame…")
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                RemoteDesktopView(image: image, input: vm.session.input)
+                if image == nil { ProgressView("Waiting for the desktop…").padding().background(.regularMaterial).cornerRadius(8) }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
             HStack(spacing: 8) {
-                Circle().fill(.green).frame(width: 10, height: 10)
-                Text(statusText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                if downloadStatus.isActive {
-                    // Activity light: a server→Mac clipboard file download is
-                    // staging into the cache directory.
-                    Circle().fill(.orange).frame(width: 10, height: 10)
-                        .padding(.leading, 8)
-                    Text(downloadText)
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    // Abort an accidental large copy: stops the download and
-                    // clears the cache dir.
-                    Button(role: .cancel) {
-                        clipboard.cancelDownloads()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Cancel download and clear the clipboard cache")
-                }
-
+                Label("Connected", systemImage: "checkmark.circle.fill").foregroundStyle(.secondary)
+                if let dimensions { Text(dimensions.displayName).foregroundStyle(.secondary) }
                 Spacer()
-
-                Menu {
-                    // Standard desktop sizes. Choosing one re-negotiates the live
-                    // session's resolution via onResize (see RDPSession).
-                    ForEach(RDPResolution.presets) { res in
-                        Button(res.displayName) {
-                            onResize(res.width, res.height)
+                if download.isActive {
+                    ProgressView(value: Double(download.bytesDone), total: Double(max(1, download.bytesTotal))).frame(width: 100)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(download.bytesDone), countStyle: .file))
+                    Button { vm.session.clipboard.cancelDownloads() } label: { Image(systemName: "xmark.circle") }
+                        .buttonStyle(.borderless).help("Cancel clipboard download").accessibilityLabel("Cancel clipboard download")
+                }
+            }.font(.caption).padding(.horizontal, 12).padding(.vertical, 8)
+        }
+        .navigationTitle(vm.targetName)
+        .toolbar {
+            ToolbarItemGroup {
+                if hasFiles {
+                    Button { showFiles.toggle() } label: { Label("Files Ready", systemImage: "arrow.down.doc") }
+                        .popover(isPresented: $showFiles) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Clipboard Files Ready").font(.headline)
+                                Text("Use ⌥⌘V in a Finder folder to move the files, or choose a destination below.").fixedSize(horizontal: false, vertical: true)
+                                Text("Moves within the same volume avoid a second copy. Other volumes require copying the data.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Button("Save to…", action: saveFiles)
+                            }.padding().frame(width: 290)
                         }
-                    }
-                } label: {
-                    Label("Resolution", systemImage: "rectangle.arrow.triangle.2.circlepath")
                 }
-                .fixedSize()
-                .help("Change the remote desktop resolution")
-
-                if hasStagedFiles && !downloadStatus.isActive {
-                    // Server→Mac files are staged in the cache. Save-to MOVES
-                    // (renames) them to a chosen folder — no second SSD write.
-                    Button {
-                        showSavePanel = true
-                    } label: {
-                        Label("Save to…", systemImage: "arrow.down.doc")
+                Menu {
+                    ForEach(RDPResolution.presets) { size in
+                        Button(size.displayName) { vm.session.setResolution(width: size.width, height: size.height) }
                     }
-                    .help("Move the copied file(s) out of the cache to a folder you choose (move, not copy). In Finder, ⌥⌘V (“Move Item Here”) also moves instead of copying.")
-
-                    // Remind the user the Save-to button is optional:
-                    // ⌥⌘V in a Finder folder moves the staged file(s)
-                    // out of the cache just the same.
-                    Text("Hint: press ⌥⌘V in a Finder folder to move it there")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-
-                Text("⌘-shortcuts stay on the Mac · Ctrl-click = right-click")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                Button("Disconnect", action: onDisconnect)
+                } label: { Label("Display", systemImage: "display") }
+                .help("Change resolution by reconnecting to the desktop")
+                Button("Disconnect", action: vm.disconnect)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.windowBackgroundColor))
-        .onReceive(refreshTimer) { _ in
-            if let (revision, latest) = framebuffer.latestImage(after: lastRevision) {
-                lastRevision = revision
-                image = latest
+        .onReceive(frames) { _ in
+            if let frame = vm.session.framebuffer.latestImage(after: lastRevision) {
+                lastRevision = frame.revision
+                image = frame.image
             }
-            let status = clipboard.currentDownloadStatus()
-            if status != downloadStatus { downloadStatus = status }
-            // Retire the Save-to button if the staged files already left the
-            // cache (e.g. moved out via Finder's ⌥⌘V "Move Item Here").
+        }
+        .onReceive(status) { _ in
+            let clipboard = vm.session.clipboard
             clipboard.pruneStagedURLs()
-            let staged = clipboard.hasStagedFiles
-            if staged != hasStagedFiles { hasStagedFiles = staged }
-        }
-        .fileImporter(isPresented: $showSavePanel,
-                      allowedContentTypes: [.folder],
-                      allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let dir = urls.first {
-                clipboard.moveStaged(to: dir)
+            hasFiles = clipboard.hasStagedFiles
+            download = clipboard.currentDownloadStatus()
+            dimensions = vm.session.currentResolution
+            if let message = download.error {
+                error = message
+                clipboard.updateDownloadStatus { $0.error = nil }
             }
         }
+        .alert("Clipboard transfer", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("OK") { error = nil }
+        } message: { Text(error ?? "") }
     }
 
-    private var downloadText: String {
-        let current = min(downloadStatus.filesDone + 1, downloadStatus.filesTotal)
-        var text = "Downloading clipboard (\(current)/\(downloadStatus.filesTotal))"
-        if !downloadStatus.currentFile.isEmpty {
-            text += " — \(downloadStatus.currentFile)"
+    private func saveFiles() {
+        showFiles = false
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Save Here"
+        guard let window = NSApp.keyWindow else { return }
+        panel.beginSheetModal(for: window) { result in
+            if result == .OK, let url = panel.url { vm.session.clipboard.moveStaged(to: url) }
         }
-        if downloadStatus.bytesTotal > 0 {
-            let done = ByteCountFormatter.string(fromByteCount: Int64(downloadStatus.bytesDone),
-                                                 countStyle: .file)
-            let total = ByteCountFormatter.string(fromByteCount: Int64(downloadStatus.bytesTotal),
-                                                  countStyle: .file)
-            text += " · \(done)/\(total)"
-        }
-        text += " · saved to ~/Library/Caches/simpleRDP/RemoteClipboard/"
-        return text
-    }
-
-    private var statusText: String {
-        var text = state.displayLabel
-        // Prefer the session-reported resolution (updates the instant a resize
-        // reconnect succeeds). Fall back to the framebuffer's frame-derived
-        // dims for sessions without a reported resolution.
-        if let res = currentResolution() {
-            text += " · \(res.width)×\(res.height)"
-        } else if let dims = framebuffer.dimensions {
-            text += " · \(dims.width)×\(dims.height)"
-        }
-        return text
     }
 }

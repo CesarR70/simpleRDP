@@ -7,6 +7,17 @@ A simple, native macOS RDP client written in **Swift / SwiftUI**, built on top o
 the RDP protocol). The app is a thin native shell — UI, favorites, macOS
 clipboard/Finder integration — while libfreerdp does the protocol heavy lifting.
 
+## Version 1.2
+
+See [release notes](RELEASE-NOTES-1.2.md) for safety fixes, the native UI refresh,
+and the suggested live-testing checklist.
+
+**The 1.2 portable Apple Silicon build requires macOS 26 or later**, because
+the bundled FreeRDP/WinPR libraries require it. The Swift source targets macOS
+13, but an older-OS build also requires compatible builds of every dependency.
+The bundle script computes the actual minimum instead of advertising an
+unsupported deployment target.
+
 ## What it does
 
 - **Connect to Windows RDP endpoints** (Windows 10/11, Server) and **xrdp** Linux
@@ -46,7 +57,7 @@ the Swift extension works; a `simpleRDP.code-workspace` file is included).
 
 ```bash
 git clone https://github.com/CesarR70/simpleRDP.git
-cd myRDP
+cd simpleRDP
 brew install freerdp pkg-config
 
 # Build (debug or release)
@@ -64,9 +75,9 @@ message instead of a wall of clang errors. `Package.swift` resolves FreeRDP
 through pkg-config **plus** arch-conditional Homebrew prefix flags, so even
 SourceKit-LSP in VS Code can build without environment shims.
 
-## Requirements
+## Source build requirements
 
-- macOS 13 (Ventura) or newer
+- macOS 13 (Ventura) or newer **and dependencies built for the target OS**; the current portable release requires macOS 26+
 - [Xcode Command Line Tools](https://developer.apple.com/download/all/) (`xcode-select --install`)
 - [Homebrew](https://brew.sh)
 - FreeRDP + pkg-config:
@@ -89,10 +100,34 @@ Intel-friendly fallbacks via arch-conditional Homebrew prefixes.
 1. Launch the app, enter `host` or `host:port`, pick endpoint kind, optionally
    a share folder, and the starting resolution.
 2. Type the password (never saved), click **Connect**.
-3. Save the server as a **favorite** for one-click form filling later.
+3. Save the server as a **favorite**, then select it in the left sidebar to fill the form later.
 4. While connected, use the **Resolution** menu in the session toolbar to
    resize live; ⌘-shortcuts stay local; Ctrl-click = right-click.
 
+
+## Tests
+
+```bash
+./Scripts/test.sh   # regression suite; works with Command Line Tools alone
+swift test          # same test cases via XCTest, with full Xcode selected
+```
+
+Clipboard paths and symlinks, failed saves, name collisions, ports, wheel
+encoding, favorite preservation, cancellation, and lifecycle cleanup are covered.
+Live Windows/xrdp interoperability and visual/accessibility testing remain manual.
+
+## Security and clipboard notes
+
+- **Disable certificate verification — Lab Use Only** disables all certificate
+  identity checks. Leave it off outside an explicitly trusted lab network.
+- One window/session intentionally owns clipboard synchronization.
+- Remote downloads use private per-transfer cache directories. Cancelled workers
+  clean their own files; completed files are retired on replacement/quit, and
+  abandoned directories from crashes are removed on the next application start.
+- Save failures preserve unsaved staged files and show an error.
+- Same-volume moves avoid a second copy. Cross-volume moves must copy bytes;
+  plain Finder ⌘V also copies. Finder ⌥⌘V moves.
+- Mac → remote file clipboard currently supports regular files, not folders.
 
 ## Distribution / Gatekeeper notes (important for releases)
 
@@ -129,7 +164,7 @@ SwiftUI (ConnectView / SessionView)
    │
    ├── SessionViewModel (@MainActor ObservableObject)
    │
-   ├── RDPSession (actor) ── owns the freerdp* instance, event-loop thread,
+   ├── RDPSession (worker owner) ── owns the freerdp* instance, event-loop thread,
    │   └─ settings, clipboard + input channels, deferred resize requests
    │
    ├── Framebuffer ── lock-protected latest frame, fed by EndPaint callback
@@ -143,8 +178,8 @@ SwiftUI (ConnectView / SessionView)
 - **FreeRDP interop** goes through the `CFreeRDP` SPM `systemLibrary` target:
   a small `shim.h` re-exposes the headers and provides nillable inline helpers
   for the GDI primary buffer.
-- **Event loop** runs on a dedicated thread; actor isolation keeps pointer
-  lifetime safe; UI updates hop to `MainActor` via an `AsyncStream`.
+- **Event loop** runs on a dedicated thread; a locked abort handle and worker-owned cleanup protect pointer
+  lifetime; UI updates hop to `MainActor` via an `AsyncStream`.
 - **Channels:** CLIPRDR (clipboard text/files) + RDPDR (share folder) are
   loaded from the `LoadChannels` callback — required timing for FreeRDP.
 - **Resize** requests are queued to the event-loop thread and applied via

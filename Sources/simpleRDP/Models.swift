@@ -41,7 +41,7 @@ struct ServerFavorite: Codable, Identifiable, Hashable {
 
     /// Host display string, omitting the port when it's the RDP default.
     var displayHostPort: String {
-        port == 3389 ? host : "\(host):\(port)"
+        (try? ConnectionAddress(host, defaultPort: port).display) ?? host
     }
 
     // Memberwise init — the custom `init(from:)` below suppresses the
@@ -105,8 +105,6 @@ struct RDPResolution: Equatable, Identifiable, Hashable, Codable {
         RDPResolution(width: 2560, height: 1440),
     ]
 }
-
-/// Connection lifecycle state surfaced to the UI. Kept intentionally tiny so
 
 /// Connection lifecycle state surfaced to the UI. Kept intentionally tiny so
 /// it can back an `AsyncStream<ConnectionState>` without leaking FreeRDP types.

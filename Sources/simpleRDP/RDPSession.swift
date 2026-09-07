@@ -1,58 +1,7 @@
-//
-// RDPSession.swift — Swift wrapper around a libfreerdp session.
-//
-// Architecture (per RDP-Swift-Client-Plan.md §3, §6):
-//   - All FreeRDP interaction is hidden behind this type. UI never touches C.
-//   - The FreeRDP event loop runs on a dedicated pthread off the main thread.
-//     The actor isolates pointer lifetime; UI updates marshal back to MainActor
-//     via `stateStream`.
-//
-// Lifecycle:
-//   1. `connect(...)` calls `freerdp_new` + `freerdp_context_new`, configures
-//      settings via the modern `freerdp_settings_set_*` API, and finally
-//      `freerdp_connect`.
-//   2. A background thread drives `freerdp_check_fds` until the session ends.
-//   3. `disconnect()` calls `freerdp_disconnect`, then `freerdp_context_free`
-//      and `freerdp_free` (context must be freed BEFORE the instance).
-//
-// Framebuffer + input (Milestone 2):
-//   - PostConnect initializes the GDI software renderer, then installs
-//     BeginPaint/EndPaint/DesktopResize callbacks. EndPaint copies each
-//     composited frame into `framebuffer` (see Framebuffer.swift); SessionView
-//     polls it at ~30 Hz and paints a CGImage.
-//   - Input flows through `input` (RemoteInput): RemoteDesktopView captures
-//     AppKit key/mouse events on the main thread and forwards them as RDP
-//     input PDUs.
-//   - CLIPRDR clipboard (Milestone 4): ClipboardChannel bridges NSPasteboard.
-//     Text works both directions. File copy/paste works BOTH ways:
-//     Mac → server serves FileGroupDescriptorW + FileContents (the xrdp
-//     thinclient_drives path is server-side); server → Mac downloads via
-//     FileContents RANGE requests into a cache dir and publishes real file
-//     URLs (Finder won't paste file promises). Image clipboard is future work.
-//   - No certificate trust callback yet (cert-pinning is Milestone 5). We
-//     expose a `trustAllCertificates` flag for lab/test setups.
-//
-
+// RDPSession.swift — one worker owns allocation, connect, reconnect, and teardown.
+// Only the documented abort API crosses threads; its pointer lifetime is locked.
 import Foundation
 import CFreeRDP
-
-// MARK: - Certificate verification callbacks
-//
-// FreeRDP's TLS layer calls these when it cannot decide a certificate's fate
-// on its own: an unknown host with no pinned key, a PINNED KEY THAT CHANGED
-// (VerifyChangedCertificateEx — the "REMOTE HOST IDENTIFICATION HAS CHANGED"
-// case), or a name mismatch. Without them the handshake aborts with
-// ERRCONNECT_TLS_CONNECT_FAILED.
-//
-// Policy for a lab/dev client: when the connection opted into
-// `trustAllCertificates`, accept the presented certificate and REPLACE the
-// stored pin (return 1). When it did not, reject (return 0). A future
-// Milestone-5 nicety is a real "accept once / accept always" prompt driving
-// the return value.
-//
-// `@convention(c)` closures cannot capture Swift context, so the
-// trust-all flag is looked up per-instance via a small registry, mirroring
-// FramebufferRegistry.
 
 private final class CertTrustRegistry {
     static let shared = CertTrustRegistry()
@@ -89,8 +38,8 @@ private let verifyCertificateExCb: pVerifyCertificateEx = {
     let cn = commonName.map { String(cString: $0) } ?? "?"
     let fp = fingerprint.map { String(cString: $0) } ?? "?"
     print("[RDPSession] certificate for \(hostStr):\(port) (CN \(cn)) fingerprint \(fp) "
-          + "-> \(trust ? "ACCEPTED & stored (trust-all)" : "REJECTED")")
-    return trust ? 1 : 0 // 1 = accept & store, 0 = reject
+          + "-> \(trust ? "ACCEPTED for this connection (verification disabled)" : "REJECTED")")
+    return trust ? 2 : 0 // Accept once; never silently create a persistent pin.
 }
 
 private let verifyChangedCertificateExCb: pVerifyChangedCertificateEx = {
@@ -99,8 +48,8 @@ private let verifyChangedCertificateExCb: pVerifyChangedCertificateEx = {
     let hostStr = host.map { String(cString: $0) } ?? "?"
     let cn = commonName.map { String(cString: $0) } ?? "?"
     print("[RDPSession] host key CHANGED for \(hostStr):\(port) (CN \(cn)) "
-          + "-> \(trust ? "ACCEPTED, pin replaced (trust-all)" : "REJECTED")")
-    return trust ? 1 : 0 // 1 = accept new key and overwrite the stored pin
+          + "-> \(trust ? "ACCEPTED for this connection (verification disabled)" : "REJECTED")")
+    return trust ? 2 : 0 // Never overwrite a stored pin silently.
 }
 
 /// Top-level error type surfaced by `RDPSession`.
@@ -111,166 +60,173 @@ struct RDPError: Error, LocalizedError {
     var errorDescription: String? { message }
 }
 
-actor RDPSession {
-    // MARK: - Public state
-
-    /// Stream of connection lifecycle events. Safe to consume from MainActor;
-    /// the actor publishes each transition exactly once.
-    nonisolated let stateStream: AsyncStream<ConnectionState>
+final class RDPSession: @unchecked Sendable {
+    let stateStream: AsyncStream<ConnectionState>
     private let stateContinuation: AsyncStream<ConnectionState>.Continuation
-
-    private(set) var state: ConnectionState = .idle {
-        didSet { stateContinuation.yield(state) }
-    }
-
-    // MARK: - FreeRDP handles
-
-    /// Pointer to `freerdp` (typedef for `struct rdp_freerdp`).
-    /// Held only inside the actor to enforce single-threaded access.
-    /// Released on `disconnect()` and deinit.
-    private var instance: UnsafeMutablePointer<freerdp>?
-
-    /// Latest remote frame, fed by the EndPaint callback. Read by SessionView
-    /// on the main thread. `let` of a Sendable type, so it is safe to access
-    /// cross-actor without `await`.
     let framebuffer = Framebuffer()
-
-    /// Keyboard/mouse input sender. Attached once the handshake completes
-    /// (the rdpInput handle is valid earlier, but sending before the input
-    /// channel is up would just error out). Same cross-actor `let` story.
     let input = RemoteInput()
-
-    /// CLIPRDR clipboard bridge (text both ways, files Mac→server). Hooks are
-    /// installed before connect; the channel attaches when FreeRDP's cliprdr
-    /// add-in reports itself via the ChannelConnected PubSub event.
     let clipboard = ClipboardChannel()
 
-    /// Worker thread driving `freerdp_check_fds`.
-    private var loopThread: Thread?
-    /// Loop sentinel. Marked `nonisolated(unsafe)` so the worker thread can
-    /// read it without an actor hop. Writes are infrequent (only on connect
-    /// start and disconnect), reads are a `Bool` aligned load — a torn read
-    /// is impossible on x86/arm64.
-    private nonisolated(unsafe) var stopFlag = false
+    private let control = NSLock()
+    private var active = false
+    private var stopping = false
+    private var abortContext: UnsafeMutablePointer<rdpContext>?
+    private var pendingResolution: RDPResolution?
+    private var resolutionValue: RDPResolution?
 
-    /// Pending client-initiated resize. Written by the main actor in
-    /// `setResolution(width:height:)` and consumed/cleared by the event-loop
-    /// thread at the top of its loop, which is the ONLY place that actually
-    /// calls `freerdp_reconnect` — so a resize request can never race the loop
-    /// and tear a connection. Same nonisolated(unsafe) reasoning as stopFlag:
-    /// request is a fire-and-forget from the UI, and the loop drains it once.
-    private nonisolated(unsafe) var resizeWidth: UInt32 = 0
-    private nonisolated(unsafe) var resizeHeight: UInt32 = 0
-    private nonisolated(unsafe) var resizePending = false
+    var currentResolution: RDPResolution? {
+        control.lock()
+        defer { control.unlock() }
+        return resolutionValue
+    }
 
-    /// Session-reported resolution backing `currentResolution`. Set on connect
-    /// and after each successful resize reconnect, so the status bar reflects
-    /// the negotiated desktop size without depending on EndPaint timing. Same
-    /// nonisolated(unsafe) reasoning as stopFlag: pair of aligned UInt32s written
-    /// once per resize, read by the UI's 30 Hz poll.
-    private nonisolated(unsafe) var currentResolutionValue: RDPResolution?
+    var isRunning: Bool {
+        control.lock()
+        defer { control.unlock() }
+        return active
+    }
 
-    /// The resolution the active session is currently running at, readable
-    /// from the UI without an actor hop.
-    nonisolated var currentResolution: RDPResolution? { currentResolutionValue }
-
-    // MARK: - Init / deinit
+    /// Used on application termination after disconnect has signalled abort.
+    /// No resources are forcibly freed if a library call is slow to return.
+    func isQuiescent() -> Bool { !isRunning && clipboard.fileDownloadQueue.operationCount == 0 }
 
     init() {
-        // Static channel add-ins (cliprdr, rdpdr, …) are located through a
-        // process-wide provider chain. The full client framework registers the
-        // static-table provider inside freerdp_client_context_new() — which we
-        // don't use — so we must register it ourselves, exactly once. Without
-        // it, EVERY static channel lookup fails, freerdp_client_load_addins()
-        // errors out, and no virtual channel (clipboard included) ever loads.
         _ = Self.registerAddinProviderOnce
-
         var continuation: AsyncStream<ConnectionState>.Continuation!
-        self.stateStream = AsyncStream { c in continuation = c }
-        self.stateContinuation = continuation
+        stateStream = AsyncStream { continuation = $0 }
+        stateContinuation = continuation
     }
 
     private static let registerAddinProviderOnce: Void = {
         _ = freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0)
     }()
 
-    deinit {
-        // Synchronously free the FreeRDP instance if the user forgot to disconnect.
-        if let raw = instance {
-            freerdp_disconnect(raw)
-            destroyInstance(raw)
-        }
-        stateContinuation.finish()
+    deinit { stateContinuation.finish() }
+
+    private var shouldStop: Bool {
+        control.lock()
+        defer { control.unlock() }
+        return stopping
     }
 
-    // MARK: - Public API
-
-    /// Establish an RDP connection. Returns once the synchronous handshake
-    /// completes (success or failure). The session continues running in the
-    /// background until `disconnect()` is called.
-    func connect(to hostPort: String,
-                 username: String?,
-                 password: String?,
-                 endpointKind: EndpointKind = .auto,
-                 trustAllCertificates: Bool = false,
-                 sharePath: String? = nil,
-                 resolution: RDPResolution? = nil) async throws {
-        guard !state.isActive else {
-            throw RDPError(message: "Session is already active.", freerdpCode: nil)
+    func connect(to hostPort: String, username: String?, password: String?,
+                 endpointKind: EndpointKind = .auto, trustAllCertificates: Bool = false,
+                 sharePath: String? = nil, resolution: RDPResolution? = nil) throws {
+        let address = try ConnectionAddress(hostPort)
+        let size = resolution ?? .defaultResolution
+        guard (200...8192).contains(size.width), (200...8192).contains(size.height) else {
+            throw ValidationError("Desktop dimensions must be between 200 and 8192 pixels.")
         }
-
-        let (host, port) = FavoritesStore.splitHostPort(hostPort)
-        state = .connecting(host: "\(host):\(port)")
-
-        // 1) Allocate instance.
-        guard let raw: UnsafeMutablePointer<freerdp> = freerdp_new() else {
-            state = .failed(reason: "freerdp_new() returned NULL")
-            throw RDPError(message: "freerdp_new() returned NULL", freerdpCode: nil)
+        if let sharePath, !sharePath.isEmpty {
+            let path = (sharePath as NSString).expandingTildeInPath
+            var directory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue else {
+                throw ValidationError("The shared folder does not exist or is not a directory.")
+            }
         }
-        self.instance = raw
-
-        // 1b) Allocate the context. In FreeRDP 3.x, `freerdp_new()` ONLY
-        //     allocates the `rdp_freerdp` options struct — `instance.context`
-        //     stays NULL until `freerdp_context_new()` runs. The context owns
-        //     the settings, channels, and event-loop state, so omitting this
-        //     call is exactly the "FreeRDP instance has no context" failure.
-        guard freerdp_context_new(raw) else {
-            destroyInstance(raw)
-            self.instance = nil
-            state = .failed(reason: "freerdp_context_new() failed")
-            throw RDPError(message: "freerdp_context_new() failed", freerdpCode: nil)
+        control.lock()
+        guard !active else {
+            control.unlock()
+            throw ValidationError("Wait for the current session to disconnect.")
         }
+        active = true
+        stopping = false
+        pendingResolution = nil
+        resolutionValue = nil
+        control.unlock()
+        framebuffer.reset()
+        stateContinuation.yield(.connecting(host: address.display))
+        let worker = Thread { [self] in
+            var finalState: ConnectionState = .disconnected(reason: nil)
+            do {
+                try runConnection(host: address.host, port: address.port, username: username,
+                                  password: password, endpointKind: endpointKind,
+                                  trustAllCertificates: trustAllCertificates,
+                                  sharePath: sharePath, resolution: size)
+            } catch {
+                if !shouldStop { finalState = .failed(reason: error.localizedDescription) }
+            }
+            control.lock()
+            active = false
+            resolutionValue = nil
+            control.unlock()
+            // Only publish completion after all C resources have been destroyed.
+            stateContinuation.yield(finalState)
+        }
+        worker.name = "simpleRDP.freerdp-worker"
+        worker.start()
+    }
 
-        // The C paint callbacks can't capture Swift context, so they find this
-        // session's Framebuffer via the registry (keyed by instance address).
-        // Registered before connect because frames can arrive DURING the
-        // synchronous handshake. Unregistered in destroyInstance().
+    func disconnect() {
+        control.lock()
+        defer { control.unlock() }
+        stopping = true
+        pendingResolution = nil
+        if let context = abortContext {
+            _ = freerdp_abort_connect_context(context)
+        }
+    }
+
+    func setResolution(width: UInt32, height: UInt32) {
+        guard (200...8192).contains(width), (200...8192).contains(height) else { return }
+        control.lock()
+        defer { control.unlock() }
+        guard active, !stopping else { return }
+        pendingResolution = RDPResolution(width: width, height: height)
+    }
+
+    private func takeResolution() -> RDPResolution? {
+        control.lock()
+        defer { control.unlock() }
+        let result = pendingResolution
+        pendingResolution = nil
+        return result
+    }
+
+    private func updateResolution(_ settings: UnsafePointer<rdpSettings>) {
+        let size = RDPResolution(width: freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+                                 height: freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight))
+        control.lock()
+        resolutionValue = size
+        control.unlock()
+    }
+
+    private func runConnection(host: String, port: Int, username: String?, password: String?,
+                               endpointKind: EndpointKind, trustAllCertificates: Bool,
+                               sharePath: String?, resolution: RDPResolution) throws {
+        guard !shouldStop else { return }
+        guard let raw = freerdp_new() else { throw ValidationError("Unable to allocate an RDP session.") }
+        var hasContext = false
+        defer {
+            // Prevent new input/channel sends, wait for any existing send to finish,
+            // then destroy on this worker only. Never free after a timed-out join.
+            input.releaseAllKeys()
+            input.detach()
+            clipboard.detach()
+            control.lock()
+            abortContext = nil
+            control.unlock()
+            if hasContext {
+                freerdp_disconnect(raw)
+                uninstallClipboardChannelHooks(for: raw, channel: clipboard)
+                FramebufferRegistry.unregister(for: raw)
+                CertTrustRegistry.shared.unregister(raw)
+                freerdp_context_free(raw)
+            }
+            freerdp_free(raw)
+        }
+        guard freerdp_context_new(raw) else { throw ValidationError("Unable to allocate an RDP context.") }
+        hasContext = true
+        guard let ctx = raw.pointee.context, let settings = ctx.pointee.settings else {
+            throw ValidationError("FreeRDP did not provide connection settings.")
+        }
+        control.lock()
+        abortContext = ctx
+        let cancelled = stopping
+        control.unlock()
+        guard !cancelled else { return }
         FramebufferRegistry.register(framebuffer, for: raw)
-
-        // Clipboard: subscribe to the cliprdr channel's lifecycle events.
-        // ChannelConnected fires during freerdp_connect, so hooks go in now.
         installClipboardChannelHooks(on: raw, channel: clipboard)
-
-        // 2) Configure settings via the modern *_set_* API.
-        //    Settings live on `rdp_context` (NOT on the freerdp struct — the
-        //    `freerdp.settings` field is deprecated and only present when
-        //    built with WITH_FREERDP_DEPRECATED). Reach them via the context.
-        //    After freerdp_context_new() succeeds both pointers are guaranteed;
-        //    the guards stay as defensive checks against future API changes.
-        guard let ctx = raw.pointee.context else {
-            destroyInstance(raw)
-            self.instance = nil
-            state = .failed(reason: "freerdp instance had no context")
-            throw RDPError(message: "freerdp instance had no context", freerdpCode: nil)
-        }
-        guard let settings = ctx.pointee.settings else {
-            let code = freerdp_get_last_error(ctx)
-            destroyInstance(raw)
-            self.instance = nil
-            state = .failed(reason: "missing settings pointer")
-            throw RDPError(message: "freerdp instance had no settings", freerdpCode: code)
-        }
-
         _ = freerdp_settings_set_string(settings, FreeRDP_ServerHostname, host)
         _ = freerdp_settings_set_uint32(settings, FreeRDP_ServerPort, UInt32(port))
         if let username, !username.isEmpty {
@@ -302,11 +258,6 @@ actor RDPSession {
         if trustAllCertificates {
             _ = freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, true)
         }
-        // Register the trust-all decision for the cert callbacks, and install
-        // the callbacks themselves. IgnoreCertificate only bypasses CA/chain
-        // validation; the known-hosts PIN-CHANGE check (which is what fails on
-        // a re-imaged/reinstalled server) is only bypassable via
-        // VerifyChangedCertificateEx. Unregistered on teardown.
         CertTrustRegistry.shared.register(raw, trustAll: trustAllCertificates)
         raw.pointee.VerifyCertificateEx = verifyCertificateExCb
         raw.pointee.VerifyChangedCertificateEx = verifyChangedCertificateExCb
@@ -319,7 +270,7 @@ actor RDPSession {
         // DesktopResize callback (gdi_resize), so this is just the negotiated
         // initial resolution; the user's pre-connect pick comes from the
         // connect form / favorite, defaulting to RDPResolution.defaultResolution.
-        let startResolution = resolution ?? .defaultResolution
+        let startResolution = resolution
         _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, startResolution.width)
         _ = freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, startResolution.height)
 
@@ -350,8 +301,7 @@ actor RDPSession {
         //     surface). Without it, the first pointer update from the server
         //     dereferences a NULL cache — this was the EXC_BAD_ACCESS in
         //     update_pointer_new() seen once auth succeeded and the session
-        //     reached the ACTIVE state. The framebuffer stays headless until
-        //     Milestone 2 paints it. PostDisconnect releases the GDI surface.
+        //     reached the ACTIVE state. PostDisconnect releases the GDI surface.
         //
         // 2d) LoadChannels callback. Setting RedirectClipboard=true only flips
         //     a settings flag; the cliprdr/rdpdr channels are instantiated by
@@ -389,207 +339,39 @@ actor RDPSession {
         }
         raw.pointee.PostDisconnect = gdi_free
 
-        // 3) Synchronous handshake.
-        state = .handshaking
-        let ok = freerdp_connect(raw)
-        if !ok {
-            let code = freerdp_get_last_error(ctx)
-            let reason = freerdp_get_last_error_string(code).map { String(cString: $0) }
-                ?? "freerdp_connect failed (code \(code))"
-            // Safe on a partially-connected instance; runs PostDisconnect
-            // (gdi_free) if PostConnect already fired, avoiding a GDI leak.
-            freerdp_disconnect(raw)
-            destroyInstance(raw)
-            self.instance = nil
-            state = .failed(reason: reason)
-            throw RDPError(message: reason, freerdpCode: code)
-        }
 
-        // Input channel is live once the handshake completes.
+        guard !shouldStop else { return }
+        stateContinuation.yield(.handshaking)
+        guard freerdp_connect(raw) else { throw connectionError(ctx) }
+        guard !shouldStop else { return }
         input.attach(to: raw)
-
-        // Publish the negotiated starting size for the status bar.
-        currentResolutionValue = startResolution
-
-        state = .connected
-
-        // 4) Spawn the event-loop thread.
-        stopFlag = false
-        // Capture the raw pointer's address as a Sendable Int, then
-        // reconstruct on the worker thread. This avoids the strict-concurrency
-        // warning about non-Sendable pointer capture in @Sendable closures.
-        let rawAddress = Int(bitPattern: raw)
-        let thread = Thread { [weak self] in
-            let typed = UnsafeMutablePointer<freerdp>(bitPattern: rawAddress)
-            self?.runEventLoop(typed)
-        }
-        thread.name = "simpleRDP.freerdp-loop"
-        thread.start()
-        self.loopThread = thread
-    }
-
-    /// Request a live change of the ACTIVE session's desktop size.
-    ///
-    /// This only queues the request; the event-loop thread applies it (routes
-    /// through `freerdp_reconnect`), so there is no visible disconnect and the
-    /// session's swap between ConnectView/SessionView is never triggered. The
-    /// chosen resolution is reflected in the status bar via `framebuffer.dimensions`
-    /// once the server negotiates the new size and EndPaint re-publishes.
-    ///
-    /// No-op when the session isn't active. If the server rejects the new size,
-    /// it simply stays at its current resolution — no harm done.
-    func setResolution(width: UInt32, height: UInt32) {
-        guard state == .connected, let raw = instance, raw.pointee.context != nil else { return }
-        // Fire-and-forget: the event-loop thread picks this up on its next
-        // pass (within ~100 ms, the loop's wait timeout).
-        resizeWidth = width
-        resizeHeight = height
-        resizePending = true
-    }
-
-    /// Tear down the session.
-    func disconnect() {
-        stopFlag = true
-        if let raw = instance {
-            // Politely release held keys before the channel goes away.
-            input.releaseAllKeys()
-            clipboard.detach()
-            freerdp_disconnect(raw)
-        }
-        // Bounded join so we don't deadlock if the C call is stuck.
-        loopThread?.cancel()
-        let deadline = Date().addingTimeInterval(2.0)
-        while loopThread?.isExecuting == true && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        loopThread = nil
-        if let raw = instance {
-            destroyInstance(raw)
-            instance = nil
-        }
-        state = .disconnected(reason: nil)
-    }
-
-    // MARK: - Internals
-
-    /// Release a FreeRDP instance completely. The header contract on
-    /// `rdp_freerdp.context` requires `freerdp_context_free()` to run BEFORE
-    /// `freerdp_free()` — freeing the instance alone leaks the context,
-    /// settings, and channel state.
-    private nonisolated func destroyInstance(_ raw: UnsafeMutablePointer<freerdp>) {
-        FramebufferRegistry.unregister(for: raw)
-        CertTrustRegistry.shared.unregister(raw)
-        input.detach()
-        uninstallClipboardChannelHooks(for: raw, channel: clipboard)
-        if raw.pointee.context != nil {
-            freerdp_context_free(raw)
-        }
-        freerdp_free(raw)
-    }
-
-    /// Drives FreeRDP's event loop until disconnect. Called on a dedicated
-    /// thread. Mirrors the FreeRDP sample client's loop.
-    ///
-    /// In FreeRDP 3.x the naming is a trap:
-    ///   - `freerdp_check_fds(instance)`        — transport/RDP PDUs ONLY.
-    ///   - `freerdp_check_event_handles(ctx)`   — that PLUS the channel-manager
-    ///     queue drain (`freerdp_channels_check_fds`).
-    /// Channel writes (VirtualChannelWriteEx — used by every cliprdr/rdpdr
-    /// send) are ENQUEUED on `channels->queue`; only the queue drain puts
-    /// those bytes on the socket. Looping on bare freerdp_check_fds therefore
-    /// starves ALL outgoing channel traffic while incoming channel data keeps
-    /// arriving — which is exactly the failure we chased (channels connect,
-    /// server greets us, then goes silent the moment we answer).
-    ///
-    /// `freerdp_get_event_handles` includes the channel queue's event handle,
-    /// so a queued channel write wakes the wait immediately. The 100 ms cap
-    /// bounds stopFlag latency; WAIT_TIMEOUT turns are harmless no-ops.
-    ///
-    /// The build warnings about calling actor-isolated methods from a Thread
-    /// closure are intentional: `runEventLoop` only reads `stopFlag` via its
-    /// nonisolated accessor and publishes results through `Task { await ... }`
-    /// which hops back to the actor.
-    private nonisolated func runEventLoop(_ raw: UnsafeMutablePointer<freerdp>?) {
-        guard let raw, let ctx = raw.pointee.context else {
-            Task { [weak self] in await self?.markDisconnected() }
-            return
-        }
-
+        updateResolution(settings)
+        stateContinuation.yield(.connected)
         var handles = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
-        let waitFailed: UInt32 = 0xFFFF_FFFF // WAIT_FAILED
-
-        while !stopFlag {
-            // Drain any client-initiated resize before touching handles. Applied
-            // here so freerdp_reconnect (which re-establishes the same session at
-            // the new size) runs on THIS thread — the only thread driving the event
-            // loop — never racing freerdp_check_event_handles. The next pass then
-            // waits on the fresh handle set.
-            if resizePending {
-                resizePending = false
-                applyResize(on: raw, ctx: ctx)
-                if stopFlag { break }
+        while !shouldStop && !freerdp_shall_disconnect_context(ctx) {
+            if let size = takeResolution() {
+                input.releaseAllKeys()
+                input.detach()
+                clipboard.detach()
+                freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, size.width)
+                freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, size.height)
+                guard freerdp_reconnect(raw) else { throw connectionError(ctx) }
+                guard !shouldStop else { break }
+                input.attach(to: raw)
+                updateResolution(settings)
                 continue
             }
-
             let count = freerdp_get_event_handles(ctx, &handles, 64)
-            if count == 0 { break } // instance is going away
-
-            let waitStatus = WaitForMultipleObjects(count, &handles, false, 100)
-            if waitStatus == waitFailed { break }
-
-            if !freerdp_check_event_handles(ctx) { break } // fatal or disconnected
+            if count == 0 { break }
+            if WaitForMultipleObjects(count, &handles, false, 100) == 0xFFFF_FFFF { break }
+            if !freerdp_check_event_handles(ctx) { break }
         }
-
-        // After the loop, hop back to the actor to publish the final state.
-        Task { [weak self] in
-            await self?.markDisconnected()
-        }
+        if !shouldStop, freerdp_get_last_error(ctx) != 0 { throw connectionError(ctx) }
     }
 
-    /// Apply a queued resolution change to the live session. Runs on the
-    /// event-loop thread. Updates the stored desktop settings, then asks FreeRDP
-    /// to reconnect the session at the new size; the server replies with a
-    /// Deactivate-Reactivate sequence and the existing DesktopResize callback
-    /// reallocs the GDI surface, after which EndPaint re-publishes the frame at
-    /// the new dimensions.
-    private nonisolated func applyResize(on raw: UnsafeMutablePointer<freerdp>, ctx: UnsafeMutablePointer<rdpContext>) {
-        guard let settings = ctx.pointee.settings else { return }
-        let w = resizeWidth
-        let h = resizeHeight
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, w)
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, h)
-        guard freerdp_reconnect(raw) else {
-            let code = freerdp_get_last_error(ctx)
-            let reason = freerdp_get_last_error_string(code).map { String(cString: $0) } ?? "unknown"
-            print("[RDPSession] resize reconnect failed: \(reason)")
-            return
-        }
-        currentResolutionValue = RDPResolution(width: w, height: h)
-        print("[RDPSession] resize applied at \(w)×\(h)")
-    }
-
-    private func markDisconnected() {
-        guard state.isActive else { return }
-        let reason: String?
-        if let raw = instance, let ctx = raw.pointee.context {
-            let code = freerdp_get_last_error(ctx)
-            reason = freerdp_get_last_error_string(code).map { String(cString: $0) }
-        } else {
-            reason = nil
-        }
-        state = .disconnected(reason: reason)
-    }
-}
-
-// MARK: - Bridge helpers
-
-extension RDPSession {
-    /// Convenience for the UI: returns a string identifying the current target.
-    var target: String? {
-        switch state {
-        case .connecting(let h): return h
-        case .connected:         return "connected"
-        default:                 return nil
-        }
+    private func connectionError(_ context: UnsafeMutablePointer<rdpContext>) -> RDPError {
+        let code = freerdp_get_last_error(context)
+        let reason = freerdp_get_last_error_string(code).map { String(cString: $0) } ?? "RDP connection ended."
+        return RDPError(message: reason, freerdpCode: code)
     }
 }
