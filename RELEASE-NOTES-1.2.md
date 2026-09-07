@@ -1,15 +1,5 @@
 # simpleRDP 1.2
 
-## Portable release requirements
-
-- Apple Silicon (arm64).
-- **macOS 26 or later for this prebuilt release.** The installed FreeRDP/WinPR
-  libraries require macOS 26. Source remains targeted at macOS 13, but older
-  systems need a dependency closure built for that deployment target.
-- No Homebrew installation is needed to run the portable application.
-- Ad-hoc signed; not Developer ID signed or notarized. Gatekeeper may require
-  approval in System Settings → Privacy & Security after the first launch attempt.
-
 ## Changes
 
 - Renamed the security override to **Disable certificate verification — Lab Use Only**,
@@ -41,20 +31,12 @@
   actual architecture and deployment requirements in DependencyManifest.json.
 - Added regression tests and a Command Line Tools-compatible test runner.
 
-## Validation and remaining testing
+## Portable release requirements
 
-Release compilation, 14 local regression tests, dependency-closure verification,
-and strict ad-hoc signature verification passed. The regression runner includes
-real FreeRDP cancellation and refused-loopback-connection cleanup checks.
-
-Builds and local regression tests do not substitute for Windows/xrdp testing.
-Please test both server types, repeated connect/disconnect, cancelling a stalled
-connection, resolution changes, text/file clipboard in both directions, rapid
-clipboard replacement, large-download cancellation, Finder ⌥⌘V, failed saves,
-trackpad/mouse scrolling, held-key repeat, and window close/reopen.
-
-Mac → remote clipboard folder copying is still unsupported (regular files only).
-The security override is not certificate pinning or a trust-on-first-use prompt.
-File clipboard snapshots are not protocol-locked; a server changing file data
-during a transfer can cause failure. Accessibility and older macOS builds have
-not been empirically verified. Signing/notarization remain separate release work.
+- Apple Silicon (arm64).
+- **macOS 26 or later for this prebuilt release.** The installed FreeRDP/WinPR
+  libraries require macOS 26. Source remains targeted at macOS 13, but older
+  systems need a dependency closure built for that deployment target.
+- No Homebrew installation is needed to run the portable application release.
+- Ad-hoc signed; not Developer ID signed or notarized. Gatekeeper may require
+  approval in System Settings → Privacy & Security after the first launch attempt.

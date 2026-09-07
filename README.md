@@ -7,16 +7,15 @@ A simple, native macOS RDP client written in **Swift / SwiftUI**, built on top o
 the RDP protocol). The app is a thin native shell — UI, favorites, macOS
 clipboard/Finder integration — while libfreerdp does the protocol heavy lifting.
 
+## Download
+
+A pre-compiled, portable release for **Apple Silicon Macs** is available for download here:
+[simpleRDP Releases](https://github.com/CesarR70/simpleRDP/releases)
+
 ## Version 1.2
 
 See [release notes](RELEASE-NOTES-1.2.md) for safety fixes, the native UI refresh,
 and the suggested live-testing checklist.
-
-**The 1.2 portable Apple Silicon build requires macOS 26 or later**, because
-the bundled FreeRDP/WinPR libraries require it. The Swift source targets macOS
-13, but an older-OS build also requires compatible builds of every dependency.
-The bundle script computes the actual minimum instead of advertising an
-unsupported deployment target.
 
 ## What it does
 
@@ -45,10 +44,55 @@ unsupported deployment target.
 - Status bar shows connection state, live resolution, and clipboard download
   progress (with a cancel button for accidental large copies).
 
-## Download
+## Running
 
-A pre-compiled, portable release for **Apple Silicon Macs** is available for download here:
-[simpleRDP Releases](https://github.com/CesarR70/simpleRDP/releases)
+1. Launch the app, enter `host` or `host:port`, pick endpoint kind, optionally
+   a share folder, and the starting resolution.
+2. Type the password (never saved), click **Connect**.
+3. Save the server as a **favorite**, then select it in the left sidebar to fill the form later.
+4. While connected, use the **Resolution** menu in the session toolbar to
+   resize live; ⌘-shortcuts stay local; Ctrl-click = right-click.
+
+## Security and clipboard notes
+
+- **Disable certificate verification — Lab Use Only** disables all certificate
+  identity checks. Leave it off outside an explicitly trusted lab network.
+- One window/session intentionally owns clipboard synchronization.
+- Remote downloads use private per-transfer cache directories. Cancelled workers
+  clean their own files; completed files are retired on replacement/quit, and
+  abandoned directories from crashes are removed on the next application start.
+- Save failures preserve unsaved staged files and show an error.
+- Same-volume moves avoid a second copy. Cross-volume moves must copy bytes;
+  plain Finder ⌘V also copies. Finder ⌥⌘V moves.
+- Mac → remote file clipboard currently supports regular files, not folders.
+
+## How it works (architecture in a nutshell)
+
+```
+SwiftUI (ConnectView / SessionView)
+   │
+   ├── SessionViewModel (@MainActor ObservableObject)
+   │
+   ├── RDPSession (worker owner) ── owns the freerdp* instance, event-loop thread,
+   │   └─ settings, clipboard + input channels, deferred resize requests
+   │
+   ├── Framebuffer ── lock-protected latest frame, fed by EndPaint callback
+   │   (polled at ~30 Hz; copies only when changed)
+   │
+   └── C callbacks (BeginPaint / EndPaint / DesktopResize / cert verify)
+       find their Swift targets via small instance→object registries
+       (annotated @convention(c) maps can't capture Swift context)
+```
+
+- **FreeRDP interop** goes through the `CFreeRDP` SPM `systemLibrary` target:
+  a small `shim.h` re-exposes the headers and provides nillable inline helpers
+  for the GDI primary buffer.
+- **Event loop** runs on a dedicated thread; a locked abort handle and worker-owned cleanup protect pointer
+  lifetime; UI updates hop to `MainActor` via an `AsyncStream`.
+- **Channels:** CLIPRDR (clipboard text/files) + RDPDR (share folder) are
+  loaded from the `LoadChannels` callback — required timing for FreeRDP.
+- **Resize** requests are queued to the event-loop thread and applied via
+  `freerdp_reconnect`, keeping the resize on the only thread that drives it.
 
 ## Building from source
 
@@ -89,22 +133,6 @@ brew install freerdp pkg-config
 An Apple Silicon Mac (arm64) is the tested build target; the package also has
 Intel-friendly fallbacks via arch-conditional Homebrew prefixes.
 
-### VS Code tasks
-
-`.vscode/tasks.json` provides build/run tasks:
-`swift: build (debug|release)`, `swift: clean`, `app: bundle (release)`,
-`app: run`, `deps: check freerdp`.
-
-## Running
-
-1. Launch the app, enter `host` or `host:port`, pick endpoint kind, optionally
-   a share folder, and the starting resolution.
-2. Type the password (never saved), click **Connect**.
-3. Save the server as a **favorite**, then select it in the left sidebar to fill the form later.
-4. While connected, use the **Resolution** menu in the session toolbar to
-   resize live; ⌘-shortcuts stay local; Ctrl-click = right-click.
-
-
 ## Tests
 
 ```bash
@@ -116,20 +144,7 @@ Clipboard paths and symlinks, failed saves, name collisions, ports, wheel
 encoding, favorite preservation, cancellation, and lifecycle cleanup are covered.
 Live Windows/xrdp interoperability and visual/accessibility testing remain manual.
 
-## Security and clipboard notes
-
-- **Disable certificate verification — Lab Use Only** disables all certificate
-  identity checks. Leave it off outside an explicitly trusted lab network.
-- One window/session intentionally owns clipboard synchronization.
-- Remote downloads use private per-transfer cache directories. Cancelled workers
-  clean their own files; completed files are retired on replacement/quit, and
-  abandoned directories from crashes are removed on the next application start.
-- Save failures preserve unsaved staged files and show an error.
-- Same-volume moves avoid a second copy. Cross-volume moves must copy bytes;
-  plain Finder ⌘V also copies. Finder ⌥⌘V moves.
-- Mac → remote file clipboard currently supports regular files, not folders.
-
-## Distribution / Gatekeeper notes (important for releases)
+## Gatekeeper notes
 
 The app is **ad-hoc signed** (`codesign --sign -`). That's fine for local use,
 but it means Gatekeeper will flag the downloaded app — this is normal for
@@ -142,9 +157,6 @@ unsigned/ad-hoc-signed macOS software, **not** a bug:
 xattr -dr com.apple.quarantine /path/to/simpleRDP.app
 ```
 
-- **Proper fix:** for public distribution, sign with a Developer ID certificate
-  and notarize with `xcrun notarytool`.
-
 **Portable builds:** to make the release `.app` work on machines **without**
 Homebrew, vendor the FreeRDP dylib closure into the bundle:
 
@@ -156,34 +168,6 @@ ditto -c -k --keepParent simpleRDP.app simpleRDP.zip
 This copies every Homebrew dylib the app needs into `Contents/Frameworks` and
 rewrites load paths to `@rpath` (verified by the script). The pre-built binary
 attached to GitHub Releases is produced this way.
-
-## How it works (architecture in a nutshell)
-
-```
-SwiftUI (ConnectView / SessionView)
-   │
-   ├── SessionViewModel (@MainActor ObservableObject)
-   │
-   ├── RDPSession (worker owner) ── owns the freerdp* instance, event-loop thread,
-   │   └─ settings, clipboard + input channels, deferred resize requests
-   │
-   ├── Framebuffer ── lock-protected latest frame, fed by EndPaint callback
-   │   (polled at ~30 Hz; copies only when changed)
-   │
-   └── C callbacks (BeginPaint / EndPaint / DesktopResize / cert verify)
-       find their Swift targets via small instance→object registries
-       (annotated @convention(c) maps can't capture Swift context)
-```
-
-- **FreeRDP interop** goes through the `CFreeRDP` SPM `systemLibrary` target:
-  a small `shim.h` re-exposes the headers and provides nillable inline helpers
-  for the GDI primary buffer.
-- **Event loop** runs on a dedicated thread; a locked abort handle and worker-owned cleanup protect pointer
-  lifetime; UI updates hop to `MainActor` via an `AsyncStream`.
-- **Channels:** CLIPRDR (clipboard text/files) + RDPDR (share folder) are
-  loaded from the `LoadChannels` callback — required timing for FreeRDP.
-- **Resize** requests are queued to the event-loop thread and applied via
-  `freerdp_reconnect`, keeping the resize on the only thread that drives it.
 
 ## Project layout
 
