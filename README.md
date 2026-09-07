@@ -14,8 +14,7 @@ A pre-compiled, portable release for **Apple Silicon Macs** is available for dow
 
 ## Version 1.2
 
-See [release notes](RELEASE-NOTES-1.2.md) for safety fixes, the native UI refresh,
-and the suggested live-testing checklist.
+See [release notes](RELEASE-NOTES-1.2.md) for safety fixes & the native UI refresh
 
 ## What it does
 
