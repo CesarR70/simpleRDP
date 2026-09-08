@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-![](https://github.com/CesarR70/simpleRDP/DEMO.gif)
+![](https://github.com/CesarR70/simpleRDP/blob/main/DEMO.gif)
 
 A simple, native macOS RDP client written in **Swift / SwiftUI**, built on top of
 [FreeRDP](https://www.freerdp.com/) (the mature open-source C implementation of
