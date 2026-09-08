@@ -112,9 +112,9 @@ final class SafetyTests: XCTestCase {
     }
 
     func testTransferCancellationDoesNotReset() {
-        let old = ClipboardTransfer(generation: UUID(), pasteboardChange: 1)
+        let old = ClipboardTransfer(generation: UUID())
         old.cancel()
-        let new = ClipboardTransfer(generation: UUID(), pasteboardChange: 2)
+        let new = ClipboardTransfer(generation: UUID())
         XCTAssertTrue(old.isCancelled)
         XCTAssertFalse(new.isCancelled)
     }

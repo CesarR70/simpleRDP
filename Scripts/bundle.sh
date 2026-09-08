@@ -53,8 +53,8 @@ else
     <key>CFBundleIdentifier</key>        <string>com.example.${APP_NAME}</string>
     <key>CFBundleName</key>              <string>${APP_NAME}</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.2</string>
-    <key>CFBundleVersion</key>           <string>3</string>
+    <key>CFBundleShortVersionString</key><string>1.3</string>
+    <key>CFBundleVersion</key>           <string>4</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
@@ -68,7 +68,7 @@ if [[ -f "Resources/AppIcon.icns" ]]; then
   cp "Resources/AppIcon.icns" "${APP}/Contents/Resources/AppIcon.icns"
 fi
 cp LICENSE "${APP}/Contents/Resources/LICENSE"
-cp RELEASE-NOTES-1.2.md "${APP}/Contents/Resources/ReleaseNotes.md"
+cp RELEASE-NOTES-1.3.md "${APP}/Contents/Resources/ReleaseNotes.md"
 
 # --- Optional: vendor Homebrew dylibs for portability -----------------------
 # Toggle by setting VENDOR_DYLIBS=1 in the environment. Off by default because

@@ -5,9 +5,7 @@ struct SessionView: View {
     @State private var image: CGImage?
     @State private var lastRevision: UInt64 = 0
     @State private var download = ClipboardDownloadStatus()
-    @State private var hasFiles = false
-    @State private var showFiles = false
-    @State private var error: String?
+    @State private var offer: RemoteFileOffer?
     @State private var dimensions: RDPResolution?
     private let frames = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
     private let status = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -15,7 +13,8 @@ struct SessionView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                RemoteDesktopView(image: image, input: vm.session.input)
+                RemoteDesktopView(image: image, input: vm.session.input,
+                                  beforePaste: { vm.session.clipboard.coordinator?.poll() })
                 if image == nil { ProgressView("Waiting for the desktop…").padding().background(.regularMaterial).cornerRadius(8) }
             }
             HStack(spacing: 8) {
@@ -27,23 +26,20 @@ struct SessionView: View {
                     Text(ByteCountFormatter.string(fromByteCount: Int64(download.bytesDone), countStyle: .file))
                     Button { vm.session.clipboard.cancelDownloads() } label: { Image(systemName: "xmark.circle") }
                         .buttonStyle(.borderless).help("Cancel clipboard download").accessibilityLabel("Cancel clipboard download")
+                } else if let directory = download.savedDirectory {
+                    Button("Show Download in Finder") { NSWorkspace.shared.open(directory) }
                 }
             }.font(.caption).padding(.horizontal, 12).padding(.vertical, 8)
         }
         .navigationTitle(vm.targetName)
         .toolbar {
             ToolbarItemGroup {
-                if hasFiles {
-                    Button { showFiles.toggle() } label: { Label("Files Ready", systemImage: "arrow.down.doc") }
-                        .popover(isPresented: $showFiles) {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Text("Clipboard Files Ready").font(.headline)
-                                Text("Use ⌥⌘V in a Finder folder to move the files, or choose a destination below.").fixedSize(horizontal: false, vertical: true)
-                                Text("Moves within the same volume avoid a second copy. Other volumes require copying the data.")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                Button("Save to…", action: saveFiles)
-                            }.padding().frame(width: 290)
-                        }
+                if let offer {
+                    Button { downloadFiles(offer) } label: { Label("Download Remote Files…", systemImage: "arrow.down.doc") }
+                        .disabled(download.isActive)
+                        .help("Download \(offer.itemCount) item(s) from \(vm.targetName) — \(ByteCountFormatter.string(fromByteCount: Int64(offer.bytesTotal), countStyle: .file))")
+                    Button { vm.session.clipboard.dismissFileOffer(offer.id); self.offer = nil } label: { Image(systemName: "xmark.circle") }
+                        .help("Dismiss remote file offer").accessibilityLabel("Dismiss remote file offer")
                 }
                 Menu {
                     ForEach(RDPResolution.presets) { size in
@@ -62,31 +58,24 @@ struct SessionView: View {
         }
         .onReceive(status) { _ in
             let clipboard = vm.session.clipboard
-            clipboard.pruneStagedURLs()
-            hasFiles = clipboard.hasStagedFiles
+            offer = clipboard.currentFileOffer()
             download = clipboard.currentDownloadStatus()
             dimensions = vm.session.currentResolution
-            if let message = download.error {
-                error = message
-                clipboard.updateDownloadStatus { $0.error = nil }
-            }
         }
-        .alert("Clipboard transfer", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
-            Button("OK") { error = nil }
-        } message: { Text(error ?? "") }
     }
 
-    private func saveFiles() {
-        showFiles = false
+    private func downloadFiles(_ offer: RemoteFileOffer) {
+        let clipboard = vm.session.clipboard
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Save Here"
+        panel.prompt = "Download Here"
+        panel.message = "Choose where to save \(offer.itemCount) item(s) from \(vm.targetName). No files are downloaded until you confirm."
         guard let window = NSApp.keyWindow else { return }
         panel.beginSheetModal(for: window) { result in
-            if result == .OK, let url = panel.url { vm.session.clipboard.moveStaged(to: url) }
+            if result == .OK, let url = panel.url { clipboard.downloadRemoteFiles(offer, to: url) }
         }
     }
 }

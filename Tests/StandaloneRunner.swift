@@ -48,6 +48,17 @@ func XCTUnwrap<T>(_ value: T?) throws -> T {
         try lifecycle.testCancelledConnectionCleansUpAndCanBeRetried()
         lifecycle.testDetachedClipboardDoesNotSend()
         try lifecycle.testRefusedConnectionCleansUp()
-        print("PASS: 14 regression tests (same test methods as the XCTest target).")
+        let multi = MultiSessionTests()
+        multi.testRemoteTextOwnershipAndNoEcho()
+        multi.testLocalCopyRoutesOnceAndKeepsSnapshot()
+        try multi.testRemoteFileOfferIsLazyAndStaleAcceptanceFails()
+        try multi.testDestinationFirstDownloadLeavesNoStagingOrPasteboardWrite()
+        try multi.testCancelledDownloadRemovesPartialDirectory()
+        try multi.testTabLifecycleIsIndependent()
+        multi.testCommitCannotBeCancelledHalfwayThroughLocalSave()
+        try multi.testProtocolFileNotificationOnlyFetchesMetadata()
+        multi.testBackgroundTextNotificationDoesNotRequestText()
+        try multi.testConcurrentSessionWorkersCancelIndependently()
+        print("PASS: 24 regression tests (same test methods as the XCTest target).")
     }
 }

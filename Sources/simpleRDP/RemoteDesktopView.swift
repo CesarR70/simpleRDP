@@ -25,15 +25,18 @@ import AppKit
 struct RemoteDesktopView: NSViewRepresentable {
     let image: CGImage?
     let input: RemoteInput
+    var beforePaste: (() -> Void)?
 
     func makeNSView(context: Context) -> RemoteDesktopNSView {
         let view = RemoteDesktopNSView()
         view.input = input
+        view.beforePaste = beforePaste
         return view
     }
 
     func updateNSView(_ nsView: RemoteDesktopNSView, context: Context) {
         nsView.image = image
+        nsView.beforePaste = beforePaste
     }
 }
 
@@ -42,6 +45,7 @@ final class RemoteDesktopNSView: NSView {
         didSet { needsDisplay = true }
     }
     var input: RemoteInput?
+    var beforePaste: (() -> Void)?
 
     private var lastMoveSent = Date.distantPast
     private var wheelRemainder = CGPoint.zero
@@ -61,7 +65,11 @@ final class RemoteDesktopNSView: NSView {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
-        guard let window else { return }
+        guard let window else {
+            input?.releaseAllKeys()
+            heldModifiers.removeAll()
+            return
+        }
         // Release held keys if the user switches away mid-press.
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -72,7 +80,10 @@ final class RemoteDesktopNSView: NSView {
             self?.heldModifiers.removeAll()
         }
         // Grab keyboard focus as soon as we're in a window.
-        DispatchQueue.main.async { window.makeFirstResponder(self) }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window === window else { return }
+            window.makeFirstResponder(self)
+        }
     }
 
     deinit {
@@ -219,6 +230,7 @@ final class RemoteDesktopNSView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard !event.modifierFlags.contains(.command) else { super.keyDown(with: event); return }
+        if event.keyCode == 0x09, event.modifierFlags.contains(.control) { beforePaste?() }
         input?.sendKey(event.keyCode, down: true, characters: event.characters)
     }
 

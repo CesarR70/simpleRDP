@@ -12,23 +12,24 @@ clipboard/Finder integration — while libfreerdp does the protocol heavy liftin
 A pre-compiled, portable release for **Apple Silicon Macs** is available for download here:
 [simpleRDP Releases](https://github.com/CesarR70/simpleRDP/releases)
 
-## Version 1.2
+## Version 1.3
 
-See [release notes](RELEASE-NOTES-1.2.md) for safety fixes & the native UI refresh
+See [release notes](RELEASE-NOTES-1.3.md) for session tabs and destination-first file downloads.
 
 ## What it does
 
 - **Connect to Windows RDP endpoints** (Windows 10/11, Server) and **xrdp** Linux
   hosts, with an endpoint-kind hint (Auto / Windows / xrdp) that adjusts the
   security negotiation strategy (NLA-friendly vs. TLS-first).
-- **Clipboard redirection (CLIPRDR):** text syncs both directions; **file
-  copy/paste works in both directions** as well — Mac → server streams file
-  contents over the clipboard channel, server → Mac downloads into
-  `~/Library/Caches/simpleRDP/RemoteClipboard/` with live progress, then moves
-  the staged files out to a folder you pick. Pasting into Finder with **⌥⌘V**
-  ("Move Item Here") also moves them out of the cache; plain ⌘V always
-  copies (Finder decides, not the app). (On xrdp, server-side materializes
-  via `~/thinclient_drives`.)
+- **Session tabs:** connect to multiple machines in one window; **+** or **⌘T**
+  opens another connection. Background sessions remain connected.
+- **Clipboard redirection (CLIPRDR):** remote text automatically copies to the Mac
+  from the selected tab. A new Mac copy is offered only to the selected connected
+  session; paste remotely with Ctrl+V. Mac files stream without a duplicate cache.
+- **Explicit remote file downloads:** copy remote files, click **Download Remote
+  Files…**, then choose a destination. No file contents download before approval,
+  and downloaded files never overwrite the Mac clipboard. Private temporary files
+  live inside the selected destination, not the application cache.
 - **Resolution control:** pick the starting resolution *before* connecting
   (saved per favorite), and **change resolution live** mid-session from the
   toolbar menu (very handy, this re-negotiates via a reconnect without
@@ -49,38 +50,44 @@ See [release notes](RELEASE-NOTES-1.2.md) for safety fixes & the native UI refre
    a share folder, and the starting resolution.
 2. Type the password (never saved), click **Connect**.
 3. Save the server as a **favorite**, then select it in the left sidebar to fill the form later.
-4. While connected, use the **Resolution** menu in the session toolbar to
+4. While connected, use the **Display** menu in the session toolbar to
    resize live; ⌘-shortcuts stay local; Ctrl-click = right-click.
+5. Open another connection with **+** or **⌘T**. Switch tabs without disconnecting.
+6. To receive remote files, copy them remotely and use **Download Remote Files…**
+   to choose where to save them. The prompt is a toolbar action, not a modal alert.
 
 ## Security and clipboard notes
 
 - **Disable certificate verification — Lab Use Only** disables all certificate
   identity checks. Leave it off outside an explicitly trusted lab network.
-- One window/session intentionally owns clipboard synchronization.
-- Remote downloads use private per-transfer cache directories. Cancelled workers
-  clean their own files; completed files are retired on replacement/quit, and
-  abandoned directories from crashes are removed on the next application start.
-- Save failures preserve unsaved staged files and show an error.
-- Same-volume moves avoid a second copy. Cross-volume moves must copy bytes;
-  plain Finder ⌘V also copies. Finder ⌥⌘V moves.
+- One shared clipboard coordinator prevents background tabs from overwriting the
+  Mac clipboard or receiving another session's copied text. Switching tabs alone
+  never replays stale clipboard contents. Copy locally again to send the same items
+  to a different session. Text copied before switching away is not replayed on return.
+- Accepted downloads use private `.simpleRDP-download-<UUID>` directories inside
+  the chosen destination. Workers clean partial files on cancellation, and successful
+  saves remove staging directories. Final save failures preserve files and report
+  their recovery location. A crash/forced quit can leave a hidden partial directory;
+  use Finder **⌘⇧.** to reveal it and delete it manually.
+- Remote clipboard changes cancel unfinished downloads rather than mix file versions.
+- No new files are written to `~/Library/Caches/simpleRDP/RemoteClipboard/`.
+  Leftover caches from older versions can be removed after quitting those versions.
 - Mac → remote file clipboard currently supports regular files, not folders.
 
 ## How it works (architecture in a nutshell)
 
 ```
-SwiftUI (ConnectView / SessionView)
+SwiftUI window / connection tabs
    │
-   ├── SessionViewModel (@MainActor ObservableObject)
-   │
-   ├── RDPSession (worker owner) ── owns the freerdp* instance, event-loop thread,
-   │   └─ settings, clipboard + input channels, deferred resize requests
-   │
-   ├── Framebuffer ── lock-protected latest frame, fed by EndPaint callback
-   │   (polled at ~30 Hz; copies only when changed)
-   │
-   └── C callbacks (BeginPaint / EndPaint / DesktopResize / cert verify)
-       find their Swift targets via small instance→object registries
-       (annotated @convention(c) maps can't capture Swift context)
+   └── SessionStore + shared ClipboardCoordinator
+       └── SessionViewModel per tab (MainActor ObservableObject)
+           └── RDPSession (worker owner)
+               ├── FreeRDP instance, event loop, settings, deferred resize
+               ├── ClipboardChannel + RemoteInput
+               └── Framebuffer (lock-protected latest frame)
+
+C callbacks find their Swift targets through instance → object registries.
+Only the selected desktop is rendered; background sessions keep receiving updates.
 ```
 
 - **FreeRDP interop** goes through the `CFreeRDP` SPM `systemLibrary` target:

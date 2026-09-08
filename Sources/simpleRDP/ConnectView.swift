@@ -1,7 +1,8 @@
 import SwiftUI
 
 @MainActor
-final class SessionViewModel: ObservableObject {
+final class SessionViewModel: ObservableObject, Identifiable {
+    let id = UUID()
     @Published var state: ConnectionState = .idle
     @Published var lastError: String?
     @Published var host = ""

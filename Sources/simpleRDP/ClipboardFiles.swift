@@ -11,6 +11,13 @@ struct RemoteClipboardFile {
     var topLevel: String { String(relativePath.split(separator: "/")[0]) }
 }
 
+struct RemoteFileOffer: Identifiable {
+    let id: UUID
+    let files: [RemoteClipboardFile]
+    var bytesTotal: UInt64 { files.reduce(0) { $0 + $1.size } }
+    var itemCount: Int { Set(files.map(\.topLevel)).count }
+}
+
 struct ClipboardDownloadStatus: Equatable {
     var isActive = false
     var filesTotal = 0
@@ -19,6 +26,7 @@ struct ClipboardDownloadStatus: Equatable {
     var bytesDone: UInt64 = 0
     var currentFile = ""
     var error: String?
+    var savedDirectory: URL?
     static let idle = ClipboardDownloadStatus()
 }
 
@@ -93,14 +101,17 @@ final class ClipboardStagingArea {
     let url: URL
     private let descriptor: Int32
 
-    init(parent: URL) throws {
+    init(parent: URL, prefix: String = "") throws {
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
-        url = parent.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        url = parent.appendingPathComponent(prefix + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
         descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard descriptor >= 0 else { throw POSIXError(.EIO) }
+        guard descriptor >= 0 else {
+            try? FileManager.default.removeItem(at: url)
+            throw POSIXError(.EIO)
+        }
     }
 
     deinit { close(descriptor) }
@@ -164,13 +175,20 @@ func moveStagedFiles(_ sources: [URL], to directory: URL) -> StagedMoveResult {
 final class ClipboardTransfer: @unchecked Sendable {
     let id = UUID()
     let generation: UUID
-    let pasteboardChange: Int
     private let lock = NSLock()
     private var cancelled = false
-    init(generation: UUID, pasteboardChange: Int) {
+    private var committing = false
+    init(generation: UUID) {
         self.generation = generation
-        self.pasteboardChange = pasteboardChange
     }
-    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func cancel() { lock.lock(); if !committing { cancelled = true }; lock.unlock() }
+    /// Once all bytes arrive, finish the local rename even if the clipboard changes.
+    func beginCommit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        committing = true
+        return true
+    }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
 }

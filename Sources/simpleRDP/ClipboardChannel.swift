@@ -33,13 +33,24 @@ final class ClipboardChannel: @unchecked Sendable {
     let sendLock = NSRecursiveLock()
     var remoteGeneration = Foundation.UUID()
     var currentTransfer: ClipboardTransfer?
-    var stagedDirectory: URL?
-    var stagedPasteboardChange = -1
+    var remoteFileOffer: RemoteFileOffer?
+    // Main-thread only; the store owns the shared coordinator.
+    weak var coordinator: ClipboardCoordinator?
+    // Selection epoch is locked so channel callbacks capture ownership at arrival,
+    // not later when a main-queue closure happens to execute.
+    var activeSelectionID: Foundation.UUID?
+
+    func setActiveSelection(_ id: Foundation.UUID?) {
+        lock.lock()
+        activeSelectionID = id
+        lock.unlock()
+    }
     struct FormatRequest {
         let kind: ClipboardDataRequestKind
         let formatID: UInt32
         let generation: Foundation.UUID
         let pasteboardChange: Int
+        let selectionID: Foundation.UUID?
     }
     var pendingFormat: FormatRequest?
     var queuedFormat: FormatRequest?
@@ -53,6 +64,8 @@ final class ClipboardChannel: @unchecked Sendable {
 
     /// Files captured when we last announced a file list; listIndex selects one.
     var servedFiles: [ServedFile] = []
+    var servedText: String?
+    var isReady = false
 
     // MARK: - Server → Mac receive state
 
@@ -70,13 +83,6 @@ final class ClipboardChannel: @unchecked Sendable {
         return q
     }()
 
-    /// The top-level cached items from the most recent server→Mac download
-    /// (real file URLs inside `clipboardCacheDirectory`). Main-thread only.
-    /// (Stored here, not in ClipboardFileReceive.swift's extension — Swift
-    /// extensions cannot hold stored properties. Setter is internal because the
-    /// writes live in ClipboardFileReceive.swift.)
-    var stagedURLs: [URL] = []
-
     /// Download progress snapshot for the UI. Guarded by `lock`; SessionView
     /// polls it on its existing refresh timer (no observation machinery).
     var downloadStatus = ClipboardDownloadStatus()
@@ -93,11 +99,6 @@ final class ClipboardChannel: @unchecked Sendable {
         lock.unlock()
     }
 
-    // MARK: - Pasteboard monitoring (main thread)
-
-    var monitorTimer: Timer?
-    var lastChangeCount = 0
-
     var serverSupportsFileClip: Bool {
         sawServerCapabilities && (serverGeneralFlags & UInt32(CB_STREAM_FILECLIP_ENABLED)) != 0
     }
@@ -113,12 +114,13 @@ final class ClipboardChannel: @unchecked Sendable {
         serverGeneralFlags = 0
         sawServerCapabilities = false
         servedFiles = []
+        servedText = nil
+        isReady = false
         lock.unlock()
 
         clip.pointee.custom = Unmanaged.passUnretained(self).toOpaque()
         installClipboardCallbacks(on: clip)
 
-        DispatchQueue.main.async { if self.clipSnapshot() != nil { self.startMonitoring() } }
     }
 
     /// Called on disconnect / channel teardown. Idempotent.
@@ -129,17 +131,20 @@ final class ClipboardChannel: @unchecked Sendable {
         clip = nil
         remoteGeneration = Foundation.UUID()
         currentTransfer?.cancel()
-        currentTransfer = nil
         pendingFormat = nil
         queuedFormat = nil
         servedFiles = []
+        servedText = nil
+        remoteFileOffer = nil
+        isReady = false
         let pending = pendingContents
         pendingContents.removeAll()
+        if currentTransfer?.isCancelled == true, downloadStatus.isActive {
+            downloadStatus.error = "The session disconnected. The unfinished download was cancelled."
+        }
         lock.unlock()
         // Fail any in-flight downloads so their semaphores release.
-        updateDownloadStatus { $0 = .idle }
         for handler in pending.values { handler(nil) }
-        DispatchQueue.main.async { if self.clipSnapshot() == nil { self.stopMonitoring() } }
     }
 
     func clipSnapshot() -> UnsafeMutablePointer<CliprdrClientContext>? {
@@ -148,37 +153,10 @@ final class ClipboardChannel: @unchecked Sendable {
         return clip
     }
 
-    // MARK: - Pasteboard monitoring
-
-    func startMonitoring() {
-        lastChangeCount = NSPasteboard.general.changeCount
-        guard monitorTimer == nil else { return }
-        monitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.checkLocalClipboard()
-        }
-    }
-
-    func stopMonitoring() {
-        monitorTimer?.invalidate()
-        monitorTimer = nil
-    }
-
-    func checkLocalClipboard() {
-        let pb = NSPasteboard.general
-        guard pb.changeCount != lastChangeCount else { return }
-        lastChangeCount = pb.changeCount
-        cancelDownloads()
+    var canAnnounceLocalClipboard: Bool {
         lock.lock()
-        remoteGeneration = Foundation.UUID()
-        queuedFormat = nil
-        lock.unlock()
-        announceLocalFormats()
-    }
-
-    /// Swallow the next monitor tick: call after WE mutate the pasteboard
-    /// from remote data, so the change doesn't echo back to the server.
-    func swallowPasteboardChange() {
-        lastChangeCount = NSPasteboard.general.changeCount
+        defer { lock.unlock() }
+        return clip != nil && isReady && !downloadStatus.isActive
     }
 }
 
@@ -250,16 +228,17 @@ extension ClipboardChannel {
         lock.unlock()
     }
 
-    /// Clipboard channel is live: answer with our capabilities, then announce
-    /// whatever is currently on the Mac pasteboard.
+    /// Only a new local copy may be announced; never replay old contents on connect.
     func onMonitorReady() {
         sendCapabilities()
-        DispatchQueue.main.async { self.announceLocalFormats() }
+        lock.lock()
+        isReady = true
+        lock.unlock()
+        DispatchQueue.main.async { self.coordinator?.poll() }
     }
 
     /// Server's clipboard changed. Acknowledge (mandatory — some servers stall
-    /// without it), then eagerly fetch the payload descriptor: files win over
-    /// text (a file copy usually also offers a path-list text form).
+    /// without it), then fetch metadata only for files. Text belongs to the selected tab.
     func onServerFormatList(_ list: CLIPRDR_FORMAT_LIST) {
         sendLock.lock()
         defer { sendLock.unlock() }
@@ -289,17 +268,23 @@ extension ClipboardChannel {
         cancelDownloads()
         lock.lock()
         let generation = Foundation.UUID()
+        let selection = activeSelectionID
         remoteGeneration = generation
         queuedFormat = nil
+        remoteFileOffer = nil
+        if currentTransfer?.isCancelled == true, downloadStatus.isActive {
+            downloadStatus.error = "The remote clipboard changed. Download cancelled; copy the files again to retry."
+        }
         lock.unlock()
         DispatchQueue.main.async { [self] in
             let kind: ClipboardDataRequestKind
             let id: UInt32
             if let fileGroupId { kind = .fileGroup; id = fileGroupId }
-            else if offersUnicodeText { kind = .text; id = UInt32(CF_UNICODETEXT) }
+            else if offersUnicodeText, selection != nil { kind = .text; id = UInt32(CF_UNICODETEXT) }
             else { return }
             enqueueFormat(FormatRequest(kind: kind, formatID: id, generation: generation,
-                                        pasteboardChange: NSPasteboard.general.changeCount))
+                                        pasteboardChange: coordinator?.pasteboard.changeCount ?? -1,
+                                        selectionID: selection))
         }
     }
 
@@ -326,7 +311,7 @@ extension ClipboardChannel {
     func onServerFormatDataRequest(_ request: CLIPRDR_FORMAT_DATA_REQUEST) {
         switch request.requestedFormatId {
         case UInt32(CF_UNICODETEXT):
-            DispatchQueue.main.async { self.respondTextData() }
+            respondTextData()
         case Self.fileGroupDescriptorFormatId:
             respondFileGroupDescriptor()
         default:
@@ -334,8 +319,7 @@ extension ClipboardChannel {
         }
     }
 
-    /// Response to our eager fetch (text or file-group descriptor) → publish
-    /// to the Mac pasteboard.
+    /// File metadata becomes an offer; selected-session text goes to the Mac.
     func onServerFormatDataResponse(_ response: CLIPRDR_FORMAT_DATA_RESPONSE) {
         lock.lock()
         let request = pendingFormat
@@ -355,7 +339,7 @@ extension ClipboardChannel {
             do {
                 let files = try parseFileGroupDescriptor(data)
                 DispatchQueue.main.async { [self] in
-                    offerRemoteFiles(files, generation: generation, pasteboardChange: request.pasteboardChange)
+                    offerRemoteFiles(files, generation: generation)
                 }
             } catch { reportClipboardError(error, generation: generation) }
         case .text:
@@ -371,11 +355,9 @@ extension ClipboardChannel {
                 lock.lock()
                 let valid = remoteGeneration == generation && clip != nil
                 lock.unlock()
-                let pb = NSPasteboard.general
-                guard valid, pb.changeCount == request.pasteboardChange else { return }
-                pb.clearContents()
-                pb.setString(string, forType: .string)
-                swallowPasteboardChange()
+                guard valid else { return }
+                coordinator?.publishRemoteText(string, from: self, selection: request.selectionID,
+                                               pasteboardChange: request.pasteboardChange)
             }
         }
     }
@@ -420,21 +402,24 @@ extension ClipboardChannel {
 // MARK: - Outgoing channel messages
 
 extension ClipboardChannel {
-    /// Announce the current Mac pasteboard contents to the server.
-    /// Called on the main thread (pasteboard access).
-    func announceLocalFormats() {
-        let pb = NSPasteboard.general
-        let urls = (pb.readObjects(forClasses: [NSURL.self],
-                                   options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-        let files = urls.compactMap { ServedFile(url: $0) }
-
+    /// Announce an immutable snapshot to one session, never read another tab's data.
+    @discardableResult
+    func announceLocalFormats(_ snapshot: LocalClipboardSnapshot) -> Bool {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         lock.lock()
+        guard clip != nil, isReady, !downloadStatus.isActive else { lock.unlock(); return false }
+        remoteGeneration = Foundation.UUID()
+        remoteFileOffer = nil
+        queuedFormat = nil
+        let files = snapshot.files
+        servedText = snapshot.text
         if !files.isEmpty, serverSupportsFileClip {
             servedFiles = files
             lock.unlock()
             sendFormatList([(Self.fileGroupDescriptorFormatId, "FileGroupDescriptorW"),
                             (Self.fileContentsFormatId, "FileContents")])
-        } else if pb.string(forType: .string) != nil {
+        } else if servedText != nil {
             servedFiles = []
             lock.unlock()
             sendFormatList([(UInt32(CF_UNICODETEXT), nil)])
@@ -444,6 +429,7 @@ extension ClipboardChannel {
             lock.unlock()
             sendFormatList([])
         }
+        return true
     }
 
     private func sendCapabilities() {
@@ -486,10 +472,12 @@ extension ClipboardChannel {
 
     // MARK: Data responses
 
-    /// Serve the current pasteboard string as CF_UNICODETEXT (UTF-16LE,
-    /// NUL-terminated). Called on the main thread.
+    /// Serve the advertised snapshot, not whatever another session later copied.
     private func respondTextData() {
-        guard let string = NSPasteboard.general.string(forType: .string) else {
+        lock.lock()
+        let text = servedText
+        lock.unlock()
+        guard let string = text else {
             respondFormatDataFailure()
             return
         }

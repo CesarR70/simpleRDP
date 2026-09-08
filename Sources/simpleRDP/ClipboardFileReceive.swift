@@ -1,63 +1,30 @@
-// Each transfer owns its directory until completion. Only a current offer may
-// publish, and only if the user has not replaced the local pasteboard meanwhile.
+// Files are offers, never Mac pasteboard contents. The destination is chosen
+// before requesting any bytes. Each worker owns its private staging directory.
 import Foundation
 import AppKit
 import CFreeRDP
 
 extension ClipboardChannel {
-    static var clipboardCacheDirectory: URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("simpleRDP/RemoteClipboard", isDirectory: true)
-    }
-    var hasStagedFiles: Bool { !stagedURLs.isEmpty }
-
-    // Startup only: never remove the shared parent while workers are writing.
-    static func cleanClipboardCache() {
-        try? FileManager.default.removeItem(at: clipboardCacheDirectory)
+    func currentFileOffer() -> RemoteFileOffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return remoteFileOffer
     }
 
-    func clearStagedFiles() {
-        precondition(Thread.isMainThread)
-        if let directory = stagedDirectory { try? FileManager.default.removeItem(at: directory) }
-        stagedDirectory = nil
-        stagedURLs = []
-    }
-
-    func pruneStagedURLs() {
-        precondition(Thread.isMainThread)
-        stagedURLs.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
-        if stagedURLs.isEmpty { clearStagedFiles() }
-    }
-
-    @discardableResult
-    func moveStaged(to directory: URL) -> Bool {
-        precondition(Thread.isMainThread)
-        let accessed = directory.startAccessingSecurityScopedResource()
-        defer { if accessed { directory.stopAccessingSecurityScopedResource() } }
-        let ownsPasteboard = NSPasteboard.general.changeCount == stagedPasteboardChange
-        let result = moveStagedFiles(stagedURLs, to: directory)
-        stagedURLs = result.remaining
-        if stagedURLs.isEmpty { clearStagedFiles() }
-        if ownsPasteboard, !result.destinations.isEmpty {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.writeObjects((result.destinations + result.remaining) as [NSURL])
-            swallowPasteboardChange()
-            stagedPasteboardChange = pb.changeCount
-        }
-        updateDownloadStatus { $0.error = result.errors.isEmpty ? nil : result.errors.joined(separator: "\n") }
-        return result.errors.isEmpty && !result.destinations.isEmpty
+    func dismissFileOffer(_ id: Foundation.UUID) {
+        lock.lock()
+        if remoteFileOffer?.id == id { remoteFileOffer = nil }
+        lock.unlock()
     }
 
     func cancelDownloads() {
         lock.lock()
         currentTransfer?.cancel()
-        currentTransfer = nil
+        // Remain active until the worker has removed partial files.
         let pending = pendingContents
         pendingContents.removeAll()
         lock.unlock()
         for handler in pending.values { handler(nil) }
-        updateDownloadStatus { $0 = .idle }
     }
 
     func reportClipboardError(_ error: Error, generation: Foundation.UUID) {
@@ -66,35 +33,69 @@ extension ClipboardChannel {
         if remoteGeneration == generation { downloadStatus.error = error.localizedDescription }
     }
 
-    func offerRemoteFiles(_ files: [RemoteClipboardFile], generation: Foundation.UUID, pasteboardChange: Int) {
-        precondition(Thread.isMainThread)
-        guard NSPasteboard.general.changeCount == pasteboardChange else { return }
+    func offerRemoteFiles(_ files: [RemoteClipboardFile], generation: Foundation.UUID) {
         lock.lock()
-        guard remoteGeneration == generation, clip != nil else { lock.unlock(); return }
-        lock.unlock()
-        cancelDownloads()
-        clearStagedFiles()
-        let transfer = ClipboardTransfer(generation: generation, pasteboardChange: pasteboardChange)
-        lock.lock()
-        guard remoteGeneration == generation else { lock.unlock(); return }
-        currentTransfer = transfer
-        lock.unlock()
-        updateDownloadStatus {
-            $0 = ClipboardDownloadStatus(isActive: true, filesTotal: files.filter { !$0.isDirectory }.count,
-                                         bytesTotal: files.reduce(0) { $0 + $1.size })
-        }
-        fileDownloadQueue.addOperation { [self] in download(files, transfer: transfer) }
+        defer { lock.unlock() }
+        guard remoteGeneration == generation, clip != nil else { return }
+        remoteFileOffer = RemoteFileOffer(id: generation, files: files)
     }
 
-    private func download(_ files: [RemoteClipboardFile], transfer: ClipboardTransfer) {
+    /// Use the offer captured before showing the destination sheet; never accept
+    /// a newer clipboard copy accidentally while the user is choosing a folder.
+    func downloadRemoteFiles(_ offer: RemoteFileOffer, to destination: URL) {
+        precondition(Thread.isMainThread)
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        lock.lock()
+        guard clip != nil, remoteGeneration == offer.id, remoteFileOffer?.id == offer.id else {
+            downloadStatus.error = "The remote clipboard changed. Copy the files again and retry."
+            lock.unlock()
+            return
+        }
+        guard !downloadStatus.isActive, fileDownloadQueue.operationCount == 0 else {
+            downloadStatus.error = "Wait for this session’s current download to finish or cancel."
+            lock.unlock()
+            return
+        }
+        let transfer = ClipboardTransfer(generation: offer.id)
+        currentTransfer = transfer
+        remoteFileOffer = nil
+        downloadStatus = ClipboardDownloadStatus(isActive: true,
+            filesTotal: offer.files.filter { !$0.isDirectory }.count, bytesTotal: offer.bytesTotal)
+        lock.unlock()
+        let accessed = destination.startAccessingSecurityScopedResource()
+        fileDownloadQueue.addOperation { [self] in
+            defer { if accessed { destination.stopAccessingSecurityScopedResource() } }
+            download(offer.files, transfer: transfer, destination: destination)
+        }
+    }
+
+    private func download(_ files: [RemoteClipboardFile], transfer: ClipboardTransfer, destination: URL) {
         var area: ClipboardStagingArea?
+        var preserveStaging = false
+        defer {
+            if let area, !preserveStaging {
+                do { try FileManager.default.removeItem(at: area.url) }
+                catch {
+                    updateStatus(for: transfer) {
+                        $0.error = "Could not remove the temporary download folder at \(area.url.path): \(error.localizedDescription)"
+                    }
+                }
+            }
+            lock.lock()
+            if currentTransfer?.id == transfer.id {
+                currentTransfer = nil
+                downloadStatus.isActive = false
+            }
+            lock.unlock()
+        }
         do {
-            guard !transfer.isCancelled else { return }
-            let stage = try ClipboardStagingArea(parent: Self.clipboardCacheDirectory)
+            guard !transfer.isCancelled else { throw CancellationError() }
+            let stage = try ClipboardStagingArea(parent: destination, prefix: ".simpleRDP-download-")
             area = stage
             let free = try stage.url.resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity
             if let free, files.reduce(UInt64(0), { $0 + $1.size }) > UInt64(max(0, free)) {
-                throw ValidationError("There is not enough disk space for this clipboard download.")
+                throw ValidationError("There is not enough disk space at the selected destination.")
             }
             for file in files {
                 guard !transfer.isCancelled else { throw CancellationError() }
@@ -117,34 +118,23 @@ extension ClipboardChannel {
                 }
                 updateStatus(for: transfer) { $0.filesDone += 1 }
             }
+            guard transfer.beginCommit() else { throw CancellationError() }
             var names = Set<String>()
             let urls = files.compactMap { file -> URL? in
                 names.insert(file.topLevel).inserted ? stage.url.appendingPathComponent(file.topLevel) : nil
             }
-            DispatchQueue.main.async { [self] in
-                lock.lock()
-                let valid = currentTransfer?.id == transfer.id && remoteGeneration == transfer.generation
-                lock.unlock()
-                guard valid, !transfer.isCancelled,
-                      NSPasteboard.general.changeCount == transfer.pasteboardChange else {
-                    try? FileManager.default.removeItem(at: stage.url)
-                    updateStatus(for: transfer) { $0 = .idle }
-                    return
-                }
-                stagedDirectory = stage.url
-                stagedURLs = urls
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.writeObjects(urls as [NSURL])
-                swallowPasteboardChange()
-                stagedPasteboardChange = pb.changeCount
-                updateStatus(for: transfer) { $0.isActive = false }
+            let result = moveStagedFiles(urls, to: destination)
+            if !result.remaining.isEmpty {
+                // Preserve completed files when finalization fails. This location
+                // is inside the selected destination, never an application cache.
+                preserveStaging = true
+                throw ValidationError(result.errors.joined(separator: "\n")
+                    + "\nUnsaved files are preserved at: \(stage.url.path)")
             }
+            updateStatus(for: transfer) { $0.savedDirectory = destination }
         } catch {
-            if let area { try? FileManager.default.removeItem(at: area.url) }
-            updateStatus(for: transfer) {
-                $0.isActive = false
-                if !transfer.isCancelled { $0.error = error.localizedDescription }
+            if !transfer.isCancelled {
+                updateStatus(for: transfer) { $0.error = error.localizedDescription }
             }
         }
     }
@@ -152,7 +142,7 @@ extension ClipboardChannel {
     private func updateStatus(for transfer: ClipboardTransfer, _ mutate: (inout ClipboardDownloadStatus) -> Void) {
         lock.lock()
         defer { lock.unlock() }
-        guard currentTransfer?.id == transfer.id, !transfer.isCancelled else { return }
+        guard currentTransfer?.id == transfer.id else { return }
         mutate(&downloadStatus)
     }
 
