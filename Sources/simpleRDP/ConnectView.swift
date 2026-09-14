@@ -137,6 +137,10 @@ struct ConnectView: View {
             .frame(maxWidth: 640, maxHeight: .infinity, alignment: .topLeading)
             .navigationTitle("simpleRDP")
         }
+        // This split view sits below the custom tab bar. On macOS 27 its
+        // title-bar background can be drawn over the connection heading.
+        // Hide only the background, keeping the native sidebar toggle.
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .onChange(of: selection) { id in
             if let favorite = favorites.favorites.first(where: { $0.id == id }) { vm.load(favorite) }
         }
